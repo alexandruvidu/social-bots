@@ -1,0 +1,8 @@
+# Covers .env, .env.old, .env.bak and any future variant — all hold live
+# credentials. The template is the one exception.
+.env*
+!.env.example
+data/
+.venv/
+__pycache__/
+*.pyc
