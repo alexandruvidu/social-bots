@@ -11,9 +11,16 @@ from dataclasses import asdict, fields
 from types import SimpleNamespace
 
 from .config import Config
-from .extract import RateLimitedError, analyze_video, extract, is_success
-from .sources.base import PostComment, SharedPost, Source, TextReply
-from .sources.instagram import InstagramSource
+from .extract import (
+    Extracted,
+    RateLimitedError,
+    analyze_image,
+    analyze_media,
+    analyze_video,
+    is_success,
+    extract,
+)
+from .sources.base import MediaReply, PostComment, SharedPost, Source, TextReply
 
 log = logging.getLogger("bot")
 
@@ -24,6 +31,16 @@ _MAX_RETRY_ATTEMPTS = 8
 ASK_TEXT = (
     "Couldn't find a destination for this one — reply with the place "
     "and I'll save it."
+)
+
+MEDIA_RETRY_TEXT = (
+    "Still couldn't tell from that image — just type the place name "
+    "and I'll save it."
+)
+
+MEDIA_RATE_LIMIT_TEXT = (
+    "I'm rate-limited right now — send that screenshot again in a few minutes, "
+    "or just type the place name."
 )
 
 
@@ -108,6 +125,66 @@ def handle_replies(store, source: Source, replies: list[TextReply]) -> None:
         store.mark_processed(reply.platform, reply.item_id)
 
 
+def handle_media_replies(store, source: Source, media_replies: list[MediaReply], cfg: Config) -> None:
+    """Resolve a pending ask from a screenshot the user sent back.
+
+    Mirrors handle_replies' pending-matching, but runs the image through Gemini
+    instead of taking the text at face value. On any failure the pending row is
+    deliberately left open so a follow-up text reply still resolves it.
+    """
+    for reply in media_replies:
+        if store.is_processed(reply.platform, reply.item_id):
+            continue
+        pending = None
+        if reply.reply_to_item_id:
+            pending = store.get_pending_by_ask_msg(reply.platform, reply.reply_to_item_id)
+        if pending is None:
+            pending = store.get_pending(reply.platform, reply.thread_id)
+        if pending is None:
+            log.info("Media reply %s matched no pending ask; ignoring.", reply.item_id)
+            store.mark_processed(reply.platform, reply.item_id)
+            continue
+
+        try:
+            result = analyze_image(reply.media_url, model=cfg.model)
+        except RateLimitedError:
+            # Don't mark processed and don't clear pending: the open row is the
+            # retry mechanism, so re-sending the screenshot just works.
+            log.warning("Gemini rate limited on screenshot %s; leaving pending open.", reply.item_id)
+            source.reply(reply.thread_id, MEDIA_RATE_LIMIT_TEXT, reply_to_item_id=reply.item_id)
+            continue
+        except Exception:  # noqa: BLE001
+            log.exception("Screenshot analysis failed for %s", reply.item_id)
+            result = Extracted()
+
+        if not is_success(result, cfg.confidence_threshold):
+            source.reply(reply.thread_id, MEDIA_RETRY_TEXT, reply_to_item_id=reply.item_id)
+            store.mark_processed(reply.platform, reply.item_id)
+            continue
+
+        saved_places, existing_places = _save_places(
+            store, source,
+            platform=reply.platform,
+            link=pending["link"],
+            result=result,
+            caption_snippet=pending["caption_snippet"],
+            cfg=cfg,
+            source_field="screenshot",
+        )
+
+        ask_msg_id = pending["ask_msg_id"]
+        if ask_msg_id:
+            store.clear_pending_by_ask_msg(reply.platform, ask_msg_id)
+        else:
+            store.clear_pending(reply.platform, reply.thread_id)
+        source.reply(
+            reply.thread_id,
+            _format_result_text(saved_places, existing_places, pending["link"]),
+            reply_to_item_id=reply.item_id,
+        )
+        store.mark_processed(reply.platform, reply.item_id)
+
+
 def _serialize_post(post: SharedPost) -> str:
     data = asdict(post)
     return json.dumps(data)
@@ -128,6 +205,44 @@ def _deserialize_post(payload: str) -> SharedPost:
     data = {k: v for k, v in data.items() if k in _SHARED_POST_FIELDS}
     data["comments"] = [PostComment(**c) for c in data.get("comments", [])]
     return SharedPost(**data)
+
+
+def _save_places(store, source: Source, *, platform: str, link: str, result,
+                 caption_snippet: str | None, cfg: Config,
+                 source_field: str | None = None) -> tuple[list, list]:
+    """Save the extracted place(s) for `link`.
+
+    Returns (newly_saved, already_present). `source_field` overrides whatever
+    Gemini reported — the screenshot path always attributes to "screenshot".
+    """
+    places = [result] + [
+        p for p in result.more_places if is_success(p, cfg.confidence_threshold)
+    ]
+    saved_places = []
+    existing_places = []
+    for place in places:
+        field = source_field or place.source_field
+        saved = store.save_destination(
+            platform=platform,
+            link=link,
+            destination=place.destination,
+            landmark=place.landmark,
+            place_type=place.place_type,
+            confidence=place.confidence,
+            source_field=field,
+            caption_snippet=caption_snippet,
+            sender=source.platform,
+        )
+        log.info(
+            "Saved %r (landmark=%r, place_type=%r, %.2f, %s) for %s (new=%s)",
+            place.destination, place.landmark, place.place_type,
+            place.confidence, field, link, saved,
+        )
+        if saved:
+            saved_places.append(place)
+        else:
+            existing_places.append(place)
+    return saved_places, existing_places
 
 
 def _process_post(store, source: Source, post: SharedPost, cfg: Config) -> None:
@@ -155,55 +270,32 @@ def _process_post(store, source: Source, post: SharedPost, cfg: Config) -> None:
         store.mark_processed(post.platform, post.item_id)
         return
     try:
-        # Comments are the least trustworthy signal (unreliable answers, and
-        # the only one that needs the risky/action-block-prone private-API
-        # call) — try caption/location alone, then the video itself, before
-        # ever spending a comments-augmented call on it.
-        result = extract(post.caption, post.location, [], model=cfg.model)
+        # With enrichment gone, a live post has no caption/location/comments —
+        # only the media the official webhook handed us. Skip the text call
+        # entirely rather than spending a Gemini request on an empty prompt.
+        result = Extracted()
+        if post.caption or post.location:
+            result = extract(post.caption, post.location, [], model=cfg.model)
         if not is_success(result, cfg.confidence_threshold) and post.media_url:
-            log.info("Caption/location extraction failed; trying video analysis for %s", post.link)
+            log.info("Analyzing media for %s (kind=%s)", post.link, post.media_kind)
             try:
-                result = analyze_video(post.media_url, model=cfg.model)
+                result = analyze_media(post.media_url, post.media_kind, model=cfg.model)
             except RateLimitedError:
                 raise
             except Exception:
-                log.warning("Video analysis failed for %s; falling back to comments.", post.link, exc_info=True)
+                log.warning("Media analysis failed for %s.", post.link, exc_info=True)
         if not is_success(result, cfg.confidence_threshold) and post.comments:
-            log.info("Video analysis failed; trying comments-augmented extraction for %s", post.link)
+            log.info("Media analysis failed; trying comments-augmented extraction for %s", post.link)
             result = extract(post.caption, post.location, post.comments, model=cfg.model)
         if is_success(result, cfg.confidence_threshold):
-            places = [result] + [
-                p for p in result.more_places
-                if is_success(p, cfg.confidence_threshold)
-            ]
-            saved_places = []
-            existing_places = []
-            for place in places:
-                saved = store.save_destination(
-                    platform=post.platform,
-                    link=post.link,
-                    destination=place.destination,
-                    landmark=place.landmark,
-                    place_type=place.place_type,
-                    confidence=place.confidence,
-                    source_field=place.source_field,
-                    caption_snippet=_snippet(post.caption),
-                    sender=source.platform,
-                )
-                log.info(
-                    "Saved %r (landmark=%r, place_type=%r, %.2f, %s) for %s (new=%s)",
-                    place.destination,
-                    place.landmark,
-                    place.place_type,
-                    place.confidence,
-                    place.source_field,
-                    post.link,
-                    saved,
-                )
-                if saved:
-                    saved_places.append(place)
-                else:
-                    existing_places.append(place)
+            saved_places, existing_places = _save_places(
+                store, source,
+                platform=post.platform,
+                link=post.link,
+                result=result,
+                caption_snippet=_snippet(post.caption),
+                cfg=cfg,
+            )
             if saved_places or existing_places:
                 source.reply(
                     post.thread_id,
@@ -275,6 +367,7 @@ def drain_retry_queue(store, source: Source, cfg: Config) -> None:
 
 
 def run_once() -> None:
+    from .sources.instagram import InstagramSource  # cron-only; not used by the webhook
     from .store import Store  # local import keeps config errors first
 
     cfg = Config.load()

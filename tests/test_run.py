@@ -47,11 +47,11 @@ def test_video_fallback_called_when_text_extract_fails():
     high_confidence = Extracted(destination="Bali, Indonesia", confidence=0.9, source_field="video")
 
     with patch("bot.run.extract", return_value=low_confidence), \
-         patch("bot.run.analyze_video", return_value=high_confidence) as mock_video:
+         patch("bot.run.analyze_media", return_value=high_confidence) as mock_media:
         handle_posts(store, source, [post], cfg)
 
-    mock_video.assert_called_once_with(
-        "https://cdn.instagram.com/video.mp4", model=cfg.model
+    mock_media.assert_called_once_with(
+        "https://cdn.instagram.com/video.mp4", None, model=cfg.model
     )
     store.save_destination.assert_called_once()
     saved_kwargs = store.save_destination.call_args.kwargs
@@ -70,10 +70,10 @@ def test_video_fallback_not_called_when_text_succeeds():
     success = Extracted(destination="Paris, France", confidence=0.95, source_field="caption")
 
     with patch("bot.run.extract", return_value=success), \
-         patch("bot.run.analyze_video") as mock_video:
+         patch("bot.run.analyze_media") as mock_media:
         handle_posts(store, source, [post], cfg)
 
-    mock_video.assert_not_called()
+    mock_media.assert_not_called()
 
 
 def test_video_fallback_not_called_when_no_media_url():
@@ -88,10 +88,10 @@ def test_video_fallback_not_called_when_no_media_url():
     low_confidence = Extracted(destination=None, confidence=0.0)
 
     with patch("bot.run.extract", return_value=low_confidence), \
-         patch("bot.run.analyze_video") as mock_video:
+         patch("bot.run.analyze_media") as mock_media:
         handle_posts(store, source, [post], cfg)
 
-    mock_video.assert_not_called()
+    mock_media.assert_not_called()
     source.reply.assert_called_once()
 
 
@@ -109,11 +109,11 @@ def test_extract_called_without_comments_first():
     success = Extracted(destination="Paris, France", confidence=0.95, source_field="caption")
 
     with patch("bot.run.extract", return_value=success) as mock_extract, \
-         patch("bot.run.analyze_video") as mock_video:
+         patch("bot.run.analyze_media") as mock_media:
         handle_posts(store, source, [post], cfg)
 
     mock_extract.assert_called_once_with(post.caption, post.location, [], model=cfg.model)
-    mock_video.assert_not_called()
+    mock_media.assert_not_called()
 
 
 def test_video_tried_before_comments_when_caption_extraction_fails():
@@ -132,10 +132,10 @@ def test_video_tried_before_comments_when_caption_extraction_fails():
     video_success = Extracted(destination="Bali, Indonesia", confidence=0.9, source_field="video")
 
     with patch("bot.run.extract", return_value=low_confidence) as mock_extract, \
-         patch("bot.run.analyze_video", return_value=video_success) as mock_video:
+         patch("bot.run.analyze_media", return_value=video_success) as mock_media:
         handle_posts(store, source, [post], cfg)
 
-    mock_video.assert_called_once_with("https://cdn.instagram.com/video.mp4", model=cfg.model)
+    mock_media.assert_called_once_with("https://cdn.instagram.com/video.mp4", None, model=cfg.model)
     # Video succeeded, so the comments-augmented retry never had to run.
     assert mock_extract.call_count == 1
     saved_kwargs = store.save_destination.call_args.kwargs
@@ -161,10 +161,10 @@ def test_falls_back_to_comments_when_caption_and_video_both_fail():
         return low_confidence
 
     with patch("bot.run.extract", side_effect=fake_extract) as mock_extract, \
-         patch("bot.run.analyze_video", return_value=low_confidence) as mock_video:
+         patch("bot.run.analyze_media", return_value=low_confidence) as mock_media:
         handle_posts(store, source, [post], cfg)
 
-    mock_video.assert_called_once()
+    mock_media.assert_called_once()
     assert mock_extract.call_count == 2
     first_call, second_call = mock_extract.call_args_list
     assert first_call.args[2] == []
@@ -185,7 +185,7 @@ def test_no_comments_retry_when_post_has_no_comments():
     low_confidence = Extracted(destination=None, confidence=0.0)
 
     with patch("bot.run.extract", return_value=low_confidence) as mock_extract, \
-         patch("bot.run.analyze_video", return_value=low_confidence):
+         patch("bot.run.analyze_media", return_value=low_confidence):
         handle_posts(store, source, [post], cfg)
 
     assert mock_extract.call_count == 1
@@ -287,11 +287,11 @@ def test_link_already_in_db_skips_gemini_and_reports_existing():
     post = _make_post()
 
     with patch("bot.run.extract") as mock_extract, \
-         patch("bot.run.analyze_video") as mock_video:
+         patch("bot.run.analyze_media") as mock_media:
         handle_posts(store, source, [post], cfg)
 
     mock_extract.assert_not_called()
-    mock_video.assert_not_called()
+    mock_media.assert_not_called()
     store.save_destination.assert_not_called()
     store.mark_processed.assert_called_once_with(post.platform, post.item_id)
 
@@ -313,7 +313,7 @@ def test_video_fallback_asks_user_when_video_also_fails():
     low = Extracted(destination=None, confidence=0.0)
 
     with patch("bot.run.extract", return_value=low), \
-         patch("bot.run.analyze_video", return_value=low):
+         patch("bot.run.analyze_media", return_value=low):
         handle_posts(store, source, [post], cfg)
 
     source.reply.assert_called_once()
@@ -438,3 +438,129 @@ def test_deserialize_post_drops_unknown_keys():
 
     assert post.item_id == "msg1"
     assert post.media_url is None
+
+
+def _make_pending(link="https://www.instagram.com/p/ABC/", ask_msg_id="ask_1"):
+    return {"link": link, "caption_snippet": "snip", "ask_msg_id": ask_msg_id}
+
+
+def test_extract_skipped_when_no_caption_or_location():
+    """No text means no prompt worth sending — go straight to the media."""
+    from bot.extract import Extracted
+
+    store = _make_store()
+    source = MagicMock()
+    source.platform = "instagram"
+    cfg = _make_cfg()
+    post = _make_post(media_url="https://lookaside.fbsbx.com/x", media_kind="video")
+    post.caption = None
+    post.location = None
+
+    found = Extracted(destination="Bali, Indonesia", confidence=0.9, source_field="video")
+
+    with patch("bot.run.extract") as mock_extract, \
+         patch("bot.run.analyze_media", return_value=found) as mock_media:
+        handle_posts(store, source, [post], cfg)
+
+    mock_extract.assert_not_called()
+    mock_media.assert_called_once_with(
+        "https://lookaside.fbsbx.com/x", "video", model=cfg.model
+    )
+    assert store.save_destination.call_args.kwargs["destination"] == "Bali, Indonesia"
+
+
+def test_media_reply_resolves_pending_row():
+    from bot.extract import Extracted
+    from bot.run import handle_media_replies
+    from bot.sources.base import MediaReply
+
+    store = _make_store()
+    store.get_pending_by_ask_msg.return_value = _make_pending()
+    source = MagicMock()
+    source.platform = "instagram"
+    cfg = _make_cfg()
+    reply = MediaReply(platform="instagram", item_id="m2", thread_id="t1",
+                       media_url="https://lookaside.fbsbx.com/shot",
+                       reply_to_item_id="ask_1")
+
+    found = Extracted(destination="Lofoten, Norway", confidence=0.9,
+                      source_field="screenshot")
+
+    with patch("bot.run.analyze_image", return_value=found):
+        handle_media_replies(store, source, [reply], cfg)
+
+    kwargs = store.save_destination.call_args.kwargs
+    assert kwargs["destination"] == "Lofoten, Norway"
+    assert kwargs["link"] == "https://www.instagram.com/p/ABC/"
+    assert kwargs["source_field"] == "screenshot"
+    store.clear_pending_by_ask_msg.assert_called_once_with("instagram", "ask_1")
+    store.mark_processed.assert_called_once_with("instagram", "m2")
+
+
+def test_media_reply_low_confidence_leaves_pending_open():
+    """A failed screenshot must not close the row — the text reply still works."""
+    from bot.extract import Extracted
+    from bot.run import MEDIA_RETRY_TEXT, handle_media_replies
+    from bot.sources.base import MediaReply
+
+    store = _make_store()
+    store.get_pending_by_ask_msg.return_value = _make_pending()
+    source = MagicMock()
+    source.platform = "instagram"
+    cfg = _make_cfg()
+    reply = MediaReply(platform="instagram", item_id="m2", thread_id="t1",
+                       media_url="https://lookaside.fbsbx.com/shot",
+                       reply_to_item_id="ask_1")
+
+    with patch("bot.run.analyze_image", return_value=Extracted(confidence=0.0)):
+        handle_media_replies(store, source, [reply], cfg)
+
+    store.save_destination.assert_not_called()
+    store.clear_pending_by_ask_msg.assert_not_called()
+    store.clear_pending.assert_not_called()
+    assert source.reply.call_args.args[1] == MEDIA_RETRY_TEXT
+
+
+def test_media_reply_rate_limited_leaves_row_unprocessed():
+    """The open pending row IS the retry mechanism — don't consume the message."""
+    from bot.extract import RateLimitedError
+    from bot.run import MEDIA_RATE_LIMIT_TEXT, handle_media_replies
+    from bot.sources.base import MediaReply
+
+    store = _make_store()
+    store.get_pending_by_ask_msg.return_value = _make_pending()
+    source = MagicMock()
+    source.platform = "instagram"
+    cfg = _make_cfg()
+    reply = MediaReply(platform="instagram", item_id="m2", thread_id="t1",
+                       media_url="https://lookaside.fbsbx.com/shot",
+                       reply_to_item_id="ask_1")
+
+    with patch("bot.run.analyze_image", side_effect=RateLimitedError(300.0)):
+        handle_media_replies(store, source, [reply], cfg)
+
+    store.save_destination.assert_not_called()
+    store.mark_processed.assert_not_called()
+    assert source.reply.call_args.args[1] == MEDIA_RATE_LIMIT_TEXT
+
+
+def test_media_reply_without_pending_is_ignored():
+    from bot.run import handle_media_replies
+    from bot.sources.base import MediaReply
+
+    store = _make_store()
+    store.get_pending_by_ask_msg.return_value = None
+    store.get_pending.return_value = None
+    source = MagicMock()
+    source.platform = "instagram"
+    cfg = _make_cfg()
+    reply = MediaReply(platform="instagram", item_id="m2", thread_id="t1",
+                       media_url="https://lookaside.fbsbx.com/shot",
+                       reply_to_item_id=None)
+
+    with patch("bot.run.analyze_image") as mock_img:
+        handle_media_replies(store, source, [reply], cfg)
+
+    mock_img.assert_not_called()
+    store.save_destination.assert_not_called()
+    store.mark_processed.assert_called_once_with("instagram", "m2")
