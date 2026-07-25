@@ -105,6 +105,37 @@ VIDEO_SYSTEM = (
 )
 
 
+SCREENSHOT_SYSTEM = (
+    "You extract the travel destination(s) from a SCREENSHOT of an Instagram post "
+    "or reel. This is a capture of a phone screen, so the app's own interface is "
+    "visible around the content. Read it in this order:\n"
+    "1. Any location/geotag label shown under the account name at the top — this "
+    "is the most reliable signal when present.\n"
+    "2. The caption text. It is often truncated with '... more', so use whatever "
+    "is legible and don't guess at the hidden part.\n"
+    "3. Text overlays burned into the media itself.\n"
+    "4. Visible comment text, which is UNRELIABLE unless it is written by the "
+    "account that posted (the same username shown at the top).\n"
+    "5. Recognizable visual landmarks, landscapes, or signs in the image.\n"
+    "Ignore Instagram's interface chrome — like/comment/share counts, button "
+    "labels, the navigation bar, the status bar, and the search field. "
+    "Put the single most prominent destination in the top-level destination field "
+    "(with its own landmark/place_type/source_field/confidence). If the screenshot "
+    "clearly shows OTHER distinct destinations too, add one entry per extra "
+    "destination to more_places, using the same fields; leave more_places empty if "
+    "there's only one destination. "
+    "Return null for a destination if no real-world place is reliably identifiable. "
+    "When you find one, normalize to 'City, Country' (or 'Region, Country' / "
+    "'Country' if more specific is unclear). "
+    "Also extract the specific named place shown or mentioned — a tourist landmark/ "
+    "attraction (e.g. 'Eiffel Tower', 'Hongya Cave'), a specific restaurant/food "
+    "stall (e.g. 'Chongqing BBQ'), or a specific hotel — or null if none is "
+    "identifiable. When a landmark is found, set place_type to one of 'landmark', "
+    "'restaurant', or 'hotel'; null if landmark is null. "
+    "Set source_field to 'screenshot', and confidence to a 0-1 score."
+)
+
+
 class Place(BaseModel):
     destination: Optional[str] = None  # "City, Country", or None if none found
     landmark: Optional[str] = None     # specific named site/attraction, or None
@@ -173,7 +204,7 @@ def analyze_video(
     with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as _tmp:
         tmp = Path(_tmp.name)
     try:
-        _download_video(video_url, tmp)
+        _download_media(video_url, tmp)
         uploaded = client.files.upload(
             file=tmp,
             config=types.UploadFileConfig(mime_type="video/mp4"),
@@ -200,6 +231,69 @@ def analyze_video(
                 log.warning("Failed to delete Gemini file %s", uploaded.name, exc_info=True)
     finally:
         tmp.unlink(missing_ok=True)
+
+
+# Fallback when the server doesn't tell us the image type. Gemini accepts
+# JPEG/PNG/WebP; JPEG is what Instagram screenshots almost always are.
+_IMAGE_MIME_DEFAULT = "image/jpeg"
+
+
+def analyze_image(
+    image_url: str,
+    *,
+    model: str = "gemini-2.5-flash",
+    client: "genai.Client | None" = None,
+) -> Extracted:
+    """Identify a destination from a single image (typically a screenshot).
+
+    Unlike analyze_video this passes bytes inline rather than going through the
+    Files API — no upload, no ACTIVE-state polling — so a screenshot reply
+    resolves in one round trip.
+    """
+    client = client or genai.Client()
+    with tempfile.NamedTemporaryFile(suffix=".img", delete=False) as _tmp:
+        tmp = Path(_tmp.name)
+    try:
+        content_type = _download_media(image_url, tmp)
+        mime = content_type if content_type.startswith("image/") else _IMAGE_MIME_DEFAULT
+        part = types.Part.from_bytes(data=tmp.read_bytes(), mime_type=mime)
+        config = types.GenerateContentConfig(
+            system_instruction=SCREENSHOT_SYSTEM,
+            response_mime_type="application/json",
+            response_schema=Extracted,
+        )
+        resp = _generate_with_retry(client, model, [part], config)
+        parsed = getattr(resp, "parsed", None)
+        if isinstance(parsed, Extracted):
+            return parsed
+        return Extracted()
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def analyze_media(
+    media_url: str,
+    kind: str | None = None,
+    *,
+    model: str = "gemini-2.5-flash",
+    client: "genai.Client | None" = None,
+) -> Extracted:
+    """Dispatch to image or video analysis, sniffing the type when unknown."""
+    if kind == "image":
+        return analyze_image(media_url, model=model, client=client)
+    if kind == "video":
+        return analyze_video(media_url, model=model, client=client)
+    # Unknown: Instagram's `share` attachment type covers both. Ask the server.
+    import httpx
+    try:
+        head = httpx.head(media_url, follow_redirects=True, timeout=15.0)
+        content_type = head.headers.get("content-type", "").split(";")[0].strip().lower()
+    except Exception:  # noqa: BLE001
+        log.warning("Could not sniff media type for %s; assuming video.", media_url)
+        content_type = ""
+    if content_type.startswith("image/"):
+        return analyze_image(media_url, model=model, client=client)
+    return analyze_video(media_url, model=model, client=client)
 
 
 def _retry_delay_seconds(e: "genai_errors.APIError") -> Optional[float]:
@@ -253,13 +347,20 @@ def _generate_with_retry(client, model, contents, config):
             raise
 
 
-def _download_video(url: str, dest: Path) -> None:
+def _download_media(url: str, dest: Path) -> str:
+    """Stream `url` to `dest`. Returns the response Content-Type (may be "").
+
+    The type is returned because Instagram's `share` attachment type doesn't
+    say whether the media is an image or a video — the server does.
+    """
     import httpx
     with httpx.stream("GET", url, follow_redirects=True, timeout=60.0) as r:
         r.raise_for_status()
+        content_type = r.headers.get("content-type", "").split(";")[0].strip().lower()
         with dest.open("wb") as fh:
             for chunk in r.iter_bytes(chunk_size=1 << 20):
                 fh.write(chunk)
+    return content_type
 
 
 def _wait_for_active(client: "genai.Client", file_name: str, timeout: float = 120.0) -> None:

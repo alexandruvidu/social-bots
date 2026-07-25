@@ -208,3 +208,78 @@ def test_analyze_video_none_parsed_returns_empty():
     with patch("httpx.stream", return_value=_mock_stream()):
         result = analyze_video("https://example.com/video.mp4", client=fake)
     assert result.destination is None
+
+
+def test_analyze_image_sends_inline_bytes_and_screenshot_prompt():
+    from unittest.mock import MagicMock, patch
+    from bot.extract import Extracted, SCREENSHOT_SYSTEM, analyze_image
+
+    client = MagicMock()
+    client.models.generate_content.return_value = MagicMock(
+        parsed=Extracted(destination="Lofoten, Norway", confidence=0.9,
+                         source_field="screenshot")
+    )
+
+    def fake_download(url, dest):
+        dest.write_bytes(b"\xff\xd8\xffFAKEJPEG")
+        return "image/jpeg"
+
+    with patch("bot.extract._download_media", side_effect=fake_download):
+        result = analyze_image("https://lookaside.fbsbx.com/x", client=client)
+
+    assert result.destination == "Lofoten, Norway"
+    # Inline bytes, not a Files API upload.
+    client.files.upload.assert_not_called()
+    contents = client.models.generate_content.call_args.kwargs["contents"]
+    part = contents[0]
+    assert part.inline_data.data == b"\xff\xd8\xffFAKEJPEG"
+    assert part.inline_data.mime_type == "image/jpeg"
+    config = client.models.generate_content.call_args.kwargs["config"]
+    assert config.system_instruction == SCREENSHOT_SYSTEM
+
+
+def test_analyze_media_dispatches_on_explicit_kind():
+    from unittest.mock import patch
+    from bot.extract import Extracted, analyze_media
+
+    with patch("bot.extract.analyze_image", return_value=Extracted()) as img, \
+         patch("bot.extract.analyze_video", return_value=Extracted()) as vid:
+        analyze_media("https://x/a", "image", model="m")
+        img.assert_called_once_with("https://x/a", model="m", client=None)
+        vid.assert_not_called()
+
+    with patch("bot.extract.analyze_image", return_value=Extracted()) as img, \
+         patch("bot.extract.analyze_video", return_value=Extracted()) as vid:
+        analyze_media("https://x/b", "video", model="m")
+        vid.assert_called_once_with("https://x/b", model="m", client=None)
+        img.assert_not_called()
+
+
+def test_analyze_media_sniffs_content_type_when_kind_unknown():
+    from unittest.mock import MagicMock, patch
+    from bot.extract import Extracted, analyze_media
+
+    head = MagicMock()
+    head.headers = {"content-type": "image/jpeg; charset=utf-8"}
+
+    with patch("httpx.head", return_value=head), \
+         patch("bot.extract.analyze_image", return_value=Extracted()) as img, \
+         patch("bot.extract.analyze_video", return_value=Extracted()) as vid:
+        analyze_media("https://x/c", None, model="m")
+
+    img.assert_called_once()
+    vid.assert_not_called()
+
+
+def test_analyze_media_defaults_to_video_when_sniff_fails():
+    """Reels dominate the shares this bot sees, so an unknown type is a video."""
+    from unittest.mock import patch
+    from bot.extract import Extracted, analyze_media
+
+    with patch("httpx.head", side_effect=RuntimeError("network down")), \
+         patch("bot.extract.analyze_image", return_value=Extracted()) as img, \
+         patch("bot.extract.analyze_video", return_value=Extracted()) as vid:
+        analyze_media("https://x/d", None, model="m")
+
+    vid.assert_called_once()
+    img.assert_not_called()
