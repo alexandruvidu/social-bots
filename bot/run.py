@@ -7,7 +7,7 @@ from __future__ import annotations
 import json
 import logging
 import sys
-from dataclasses import asdict
+from dataclasses import asdict, fields
 from types import SimpleNamespace
 
 from .config import Config
@@ -113,8 +113,19 @@ def _serialize_post(post: SharedPost) -> str:
     return json.dumps(data)
 
 
+_SHARED_POST_FIELDS = {f.name for f in fields(SharedPost)}
+
+
 def _deserialize_post(payload: str) -> SharedPost:
     data = json.loads(payload)
+    # A queued retry row can outlive a restart, so it may predate the
+    # video_url -> media_url rename. Migrate the old key, then drop anything
+    # else we no longer recognise rather than blowing up on it.
+    if "video_url" in data and "media_url" not in data:
+        legacy = data.pop("video_url")
+        data["media_url"] = legacy
+        data.setdefault("media_kind", "video" if legacy else None)
+    data = {k: v for k, v in data.items() if k in _SHARED_POST_FIELDS}
     data["comments"] = [PostComment(**c) for c in data.get("comments", [])]
     return SharedPost(**data)
 
@@ -149,10 +160,10 @@ def _process_post(store, source: Source, post: SharedPost, cfg: Config) -> None:
         # call) — try caption/location alone, then the video itself, before
         # ever spending a comments-augmented call on it.
         result = extract(post.caption, post.location, [], model=cfg.model)
-        if not is_success(result, cfg.confidence_threshold) and post.video_url:
+        if not is_success(result, cfg.confidence_threshold) and post.media_url:
             log.info("Caption/location extraction failed; trying video analysis for %s", post.link)
             try:
-                result = analyze_video(post.video_url, model=cfg.model)
+                result = analyze_video(post.media_url, model=cfg.model)
             except RateLimitedError:
                 raise
             except Exception:

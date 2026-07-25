@@ -27,7 +27,21 @@ class SharedPost:
     caption: str | None = None
     location: str | None = None
     comments: list[PostComment] = field(default_factory=list)
-    video_url: str | None = None
+    media_url: str | None = None
+    # "video" | "image" | None. None means the source couldn't tell (Instagram's
+    # `share` attachment type covers both), so the type is sniffed from the
+    # response Content-Type at download time.
+    media_kind: str | None = None
+
+
+@dataclass
+class MediaReply:
+    """An image the user sent in reply to the bot's "where is this?" ask."""
+    platform: str
+    item_id: str
+    thread_id: str
+    media_url: str
+    reply_to_item_id: str | None = None  # ID of the ask message being answered
 
 
 @dataclass

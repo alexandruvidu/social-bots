@@ -356,7 +356,8 @@ class InstagramSource(Source):
             caption=getattr(full, "caption_text", None) or None,
             location=_location_str(full),
             comments=comments,
-            video_url=_video_url(full) or _video_url(media),
+            media_url=_video_url(full) or _video_url(media),
+            media_kind="video",
         )
 
     def enrich_from_url(self, item_id: str, thread_id: str, url: str) -> "SharedPost":

@@ -7,14 +7,15 @@ from bot.run import drain_retry_queue, handle_posts
 from bot.sources.base import PostComment, SharedPost
 
 
-def _make_post(video_url=None, comments=None):
+def _make_post(media_url=None, media_kind=None, comments=None):
     return SharedPost(
         platform="instagram",
         item_id="msg1",
         thread_id="t1",
         link="https://www.instagram.com/p/ABC/",
         caption="beautiful sunset",
-        video_url=video_url,
+        media_url=media_url,
+        media_kind=media_kind,
         comments=comments or [],
     )
 
@@ -40,7 +41,7 @@ def test_video_fallback_called_when_text_extract_fails():
     source = MagicMock()
     source.platform = "instagram"
     cfg = _make_cfg()
-    post = _make_post(video_url="https://cdn.instagram.com/video.mp4")
+    post = _make_post(media_url="https://cdn.instagram.com/video.mp4")
 
     low_confidence = Extracted(destination=None, confidence=0.0)
     high_confidence = Extracted(destination="Bali, Indonesia", confidence=0.9, source_field="video")
@@ -64,7 +65,7 @@ def test_video_fallback_not_called_when_text_succeeds():
     source = MagicMock()
     source.platform = "instagram"
     cfg = _make_cfg()
-    post = _make_post(video_url="https://cdn.instagram.com/video.mp4")
+    post = _make_post(media_url="https://cdn.instagram.com/video.mp4")
 
     success = Extracted(destination="Paris, France", confidence=0.95, source_field="caption")
 
@@ -75,14 +76,14 @@ def test_video_fallback_not_called_when_text_succeeds():
     mock_video.assert_not_called()
 
 
-def test_video_fallback_not_called_when_no_video_url():
+def test_video_fallback_not_called_when_no_media_url():
     from bot.extract import Extracted
 
     store = _make_store()
     source = MagicMock()
     source.platform = "instagram"
     cfg = _make_cfg()
-    post = _make_post(video_url=None)
+    post = _make_post(media_url=None)
 
     low_confidence = Extracted(destination=None, confidence=0.0)
 
@@ -123,7 +124,7 @@ def test_video_tried_before_comments_when_caption_extraction_fails():
     source.platform = "instagram"
     cfg = _make_cfg()
     post = _make_post(
-        video_url="https://cdn.instagram.com/video.mp4",
+        media_url="https://cdn.instagram.com/video.mp4",
         comments=[PostComment(text="It's Lisbon!", likes=5)],
     )
 
@@ -149,7 +150,7 @@ def test_falls_back_to_comments_when_caption_and_video_both_fail():
     source.platform = "instagram"
     cfg = _make_cfg()
     comments = [PostComment(text="It's Lisbon!", is_creator=True, likes=5)]
-    post = _make_post(video_url="https://cdn.instagram.com/video.mp4", comments=comments)
+    post = _make_post(media_url="https://cdn.instagram.com/video.mp4", comments=comments)
 
     low_confidence = Extracted(destination=None, confidence=0.0)
     comments_success = Extracted(destination="Lisbon, Portugal", confidence=0.9, source_field="comments")
@@ -179,7 +180,7 @@ def test_no_comments_retry_when_post_has_no_comments():
     source = MagicMock()
     source.platform = "instagram"
     cfg = _make_cfg()
-    post = _make_post(video_url="https://cdn.instagram.com/video.mp4")  # no comments
+    post = _make_post(media_url="https://cdn.instagram.com/video.mp4")  # no comments
 
     low_confidence = Extracted(destination=None, confidence=0.0)
 
@@ -307,7 +308,7 @@ def test_video_fallback_asks_user_when_video_also_fails():
     source = MagicMock()
     source.platform = "instagram"
     cfg = _make_cfg()
-    post = _make_post(video_url="https://cdn.instagram.com/video.mp4")
+    post = _make_post(media_url="https://cdn.instagram.com/video.mp4")
 
     low = Extracted(destination=None, confidence=0.0)
 
@@ -396,3 +397,44 @@ def test_drain_retry_queue_gives_up_after_max_attempts():
 
     store.delete_retry.assert_called_once_with(7)
     store.reschedule_retry.assert_not_called()
+
+
+def test_deserialize_post_migrates_legacy_video_url():
+    """A retry row queued before the media_url rename must still load."""
+    import json
+    from bot.run import _deserialize_post
+
+    legacy = json.dumps({
+        "platform": "instagram",
+        "item_id": "msg1",
+        "thread_id": "t1",
+        "link": "https://www.instagram.com/p/ABC/",
+        "caption": "sunset",
+        "location": None,
+        "comments": [],
+        "video_url": "https://cdn.example.com/v.mp4",
+    })
+
+    post = _deserialize_post(legacy)
+
+    assert post.media_url == "https://cdn.example.com/v.mp4"
+    assert post.media_kind == "video"
+
+
+def test_deserialize_post_drops_unknown_keys():
+    """Unrecognised keys from any future schema drift must not raise."""
+    import json
+    from bot.run import _deserialize_post
+
+    payload = json.dumps({
+        "platform": "instagram",
+        "item_id": "msg1",
+        "thread_id": "t1",
+        "link": "https://www.instagram.com/p/ABC/",
+        "some_removed_field": "whatever",
+    })
+
+    post = _deserialize_post(payload)
+
+    assert post.item_id == "msg1"
+    assert post.media_url is None
