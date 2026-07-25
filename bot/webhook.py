@@ -18,7 +18,7 @@ from threading import Thread
 from flask import Flask, abort, request
 
 from .config import Config
-from .run import drain_retry_queue, handle_posts, handle_replies
+from .run import drain_retry_queue, handle_media_replies, handle_posts, handle_replies
 from .sources.instagram_api import InstagramAPISource
 from .store import Store
 
@@ -35,17 +35,7 @@ _components: tuple | None = None
 
 
 def _build_components() -> tuple[Config, InstagramAPISource, Store]:
-    from .sources.instagram import InstagramSource
-
     cfg = Config.load()
-    enrich = InstagramSource(
-        username=cfg.ig_username,
-        password=cfg.ig_password,
-        allowed_sender_id=cfg.allowed_sender_id,
-        session_path=cfg.session_path,
-        comments_limit=cfg.comments_limit,
-        comments_fetch_limit=cfg.comments_fetch_limit,
-    )
     source = InstagramAPISource(
         access_token=cfg.ig_access_token or "",
         ig_user_id=cfg.ig_user_id or "",
@@ -101,6 +91,7 @@ def webhook_event():
 
     posts = []
     replies = []
+    media_replies = []
 
     for entry in data.get("entry", []):
         for messaging in entry.get("messaging", []):
@@ -113,6 +104,20 @@ def webhook_event():
                 continue
             message = messaging.get("message", {})
             if message.get("attachments"):
+                # An image sent as a reply to our "where is this?" ask is an
+                # answer, not a new share — route it to the media handler.
+                reply_to_mid = (message.get("reply_to") or {}).get("mid")
+                pending = (
+                    store.get_pending_by_ask_msg(source.platform, reply_to_mid)
+                    if reply_to_mid else None
+                )
+                media_reply = (
+                    source.build_media_reply_from_event(messaging)
+                    if pending is not None else None
+                )
+                if media_reply:
+                    media_replies.append(media_reply)
+                    continue
                 post = source.build_post_from_event(messaging)
                 if post:
                     posts.append(post)
@@ -127,8 +132,12 @@ def webhook_event():
             else:
                 log.info("Message from %s had neither attachments nor text: %r", sender_id, message)
 
-    log.info("Webhook batch: %d post(s), %d reply(ies) to process.", len(posts), len(replies))
+    log.info(
+        "Webhook batch: %d post(s), %d reply(ies), %d screenshot(s) to process.",
+        len(posts), len(replies), len(media_replies),
+    )
     handle_replies(store, source, replies)
+    handle_media_replies(store, source, media_replies, cfg)
     handle_posts(store, source, posts, cfg)
     return "ok", 200
 

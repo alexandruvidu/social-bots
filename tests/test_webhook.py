@@ -37,6 +37,107 @@ def test_config_webhook_vars_default_none(monkeypatch):
     assert cfg.ig_user_id is None
 
 
+def test_config_boots_without_ig_credentials(monkeypatch):
+    """The whole point of the change: no password on disk, still starts."""
+    monkeypatch.setenv("ALLOWED_SENDER_ID", "111")
+    monkeypatch.setenv("GEMINI_API_KEY", "k")
+    monkeypatch.delenv("IG_USERNAME", raising=False)
+    monkeypatch.delenv("IG_PASSWORD", raising=False)
+
+    from bot.config import Config
+    cfg = Config.load()
+    assert cfg.ig_username is None
+    assert cfg.ig_password is None
+
+
+def test_build_components_does_not_construct_instagram_source(monkeypatch, tmp_path):
+    monkeypatch.setenv("ALLOWED_SENDER_ID", "111")
+    monkeypatch.setenv("GEMINI_API_KEY", "k")
+    monkeypatch.setenv("IG_ACCESS_TOKEN", "tok")
+    monkeypatch.setenv("IG_USER_ID", "999")
+    # _build_components opens a real sqlite file — keep it out of data/.
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "test.sqlite"))
+
+    from unittest.mock import patch
+    import bot.webhook as wh
+
+    with patch("bot.sources.instagram.InstagramSource") as mock_src:
+        cfg, source, store = wh._build_components()
+
+    mock_src.assert_not_called()
+    assert not hasattr(source, "_enrich")
+
+
+def test_attachment_replying_to_pending_ask_routes_to_media_handler():
+    from unittest.mock import MagicMock, patch
+    import json as _json
+    import bot.webhook as wh
+
+    cfg = MagicMock()
+    cfg.ig_user_id = "999"
+    cfg.allowed_sender_id = "111"
+    source = MagicMock()
+    source.platform = "instagram"
+    store = MagicMock()
+    store.get_pending_by_ask_msg.return_value = {"link": "L", "caption_snippet": None,
+                                                 "ask_msg_id": "ask_1"}
+    wh._components = (cfg, source, store)
+
+    body = {"object": "instagram", "entry": [{"messaging": [{
+        "sender": {"id": "111"},
+        "message": {"mid": "m2", "reply_to": {"mid": "ask_1"},
+                    "attachments": [{"type": "image",
+                                     "payload": {"url": "https://lookaside.fbsbx.com/s"}}]},
+    }]}]}
+
+    with patch("bot.webhook.verify_signature", return_value=True), \
+         patch("bot.webhook.handle_posts") as posts, \
+         patch("bot.webhook.handle_replies"), \
+         patch("bot.webhook.handle_media_replies") as media:
+        wh.app.test_client().post("/webhook", data=_json.dumps(body),
+                                  content_type="application/json")
+
+    wh._components = None
+    source.build_media_reply_from_event.assert_called_once()
+    source.build_post_from_event.assert_not_called()
+    assert media.call_args.args[2] != []
+    assert posts.call_args.args[2] == []
+
+
+def test_attachment_without_pending_ask_routes_to_post_handler():
+    from unittest.mock import MagicMock, patch
+    import json as _json
+    import bot.webhook as wh
+
+    cfg = MagicMock()
+    cfg.ig_user_id = "999"
+    cfg.allowed_sender_id = "111"
+    source = MagicMock()
+    source.platform = "instagram"
+    store = MagicMock()
+    store.get_pending_by_ask_msg.return_value = None
+    wh._components = (cfg, source, store)
+
+    body = {"object": "instagram", "entry": [{"messaging": [{
+        "sender": {"id": "111"},
+        "message": {"mid": "m1",
+                    "attachments": [{"type": "ig_reel",
+                                     "payload": {"url": "https://www.instagram.com/reel/X/"}}]},
+    }]}]}
+
+    with patch("bot.webhook.verify_signature", return_value=True), \
+         patch("bot.webhook.handle_posts") as posts, \
+         patch("bot.webhook.handle_replies"), \
+         patch("bot.webhook.handle_media_replies") as media:
+        wh.app.test_client().post("/webhook", data=_json.dumps(body),
+                                  content_type="application/json")
+
+    wh._components = None
+    source.build_post_from_event.assert_called_once()
+    source.build_media_reply_from_event.assert_not_called()
+    assert media.call_args.args[2] == []
+
+
 def test_enrich_from_url_returns_post_with_link_on_pk_failure():
     from unittest.mock import MagicMock, patch
     from bot.sources.instagram import InstagramSource

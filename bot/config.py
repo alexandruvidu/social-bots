@@ -32,8 +32,6 @@ _load_dotenv(PROJECT_ROOT / ".env")
 
 @dataclass(frozen=True)
 class Config:
-    ig_username: str
-    ig_password: str
     # IG user id (numeric, as a string) whose DMs we trust. Only shares from this
     # account are processed — keeps strangers from injecting data.
     allowed_sender_id: str
@@ -43,6 +41,11 @@ class Config:
     comments_limit: int
     comments_fetch_limit: int
     confidence_threshold: float
+    # Only the dormant instagrapi path (bot/sources/instagram.py) and the cron
+    # batch mode read these. The live webhook never logs in to Instagram, so
+    # the bot must start without them.
+    ig_username: str | None = None
+    ig_password: str | None = None
     ig_access_token: str | None = None
     ig_app_secret: str | None = None
     webhook_verify_token: str | None = None
@@ -56,8 +59,6 @@ class Config:
         # the environment itself (GEMINI_API_KEY or GOOGLE_API_KEY).
         _require("GEMINI_API_KEY")
         return Config(
-            ig_username=_require("IG_USERNAME"),
-            ig_password=_require("IG_PASSWORD"),
             allowed_sender_id=_require("ALLOWED_SENDER_ID"),
             model=os.environ.get("GEMINI_MODEL", "gemini-2.5-flash"),
             db_path=Path(os.environ.get("DB_PATH", DATA_DIR / "db.sqlite")),
@@ -72,6 +73,8 @@ class Config:
             webhook_verify_token=os.environ.get("WEBHOOK_VERIFY_TOKEN"),
             ig_user_id=os.environ.get("IG_USER_ID"),
             meta_app_id=os.environ.get("META_APP_ID"),
+            ig_username=os.environ.get("IG_USERNAME"),
+            ig_password=os.environ.get("IG_PASSWORD"),
         )
 
 
