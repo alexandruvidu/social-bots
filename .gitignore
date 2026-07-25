@@ -6,3 +6,5 @@ data/
 .venv/
 __pycache__/
 *.pyc
+# Subagent-driven-development scratch: ledger, briefs, review packages.
+.superpowers/
