@@ -27,7 +27,7 @@ app = Flask(__name__)
 
 # How often the background thread checks for rate-limited posts that are due
 # for a retry. Runs in its own thread with its own Store/source so it never
-# shares a sqlite connection or instagrapi session with request handling.
+# shares a sqlite connection or HTTP client with request handling.
 RETRY_POLL_INTERVAL = 45.0
 
 # Lazily initialised on first request so tests can swap out _build_components.
@@ -50,6 +50,37 @@ def _get_components() -> tuple[Config, InstagramAPISource, Store]:
     if _components is None:
         _components = _build_components()
     return _components
+
+
+def _first_attachment_type(message: dict) -> str | None:
+    attachments = message.get("attachments") or []
+    if not attachments:
+        return None
+    return attachments[0].get("type")
+
+
+def _match_pending_ask(store, source, message: dict, sender_id: str):
+    """Find the open ask this attachment is answering, or None if it's a share.
+
+    Two gestures resolve an ask. The formal one quotes the bot's message, and
+    `reply_to.mid` names it exactly. The normal one is just sending a photo into
+    the thread, with no quote at all — so a plain `image` attachment arriving
+    while an ask is open is treated as the answer to it. Discriminating on
+    attachment type (rather than on `reply_to`) is what keeps shared posts out
+    of this path: feed posts and reels arrive as `share`/`ig_reel`/`video`, never
+    as `image`.
+
+    Trade-off accepted deliberately: an unrelated photo sent while an ask is
+    open will be consumed as an answer to it.
+    """
+    reply_to_mid = (message.get("reply_to") or {}).get("mid")
+    if reply_to_mid:
+        pending = store.get_pending_by_ask_msg(source.platform, reply_to_mid)
+        if pending is not None:
+            return pending
+    if _first_attachment_type(message) == "image":
+        return store.get_pending(source.platform, sender_id)
+    return None
 
 
 def verify_signature(payload: bytes, signature_header: str | None, app_secret: str) -> bool:
@@ -104,13 +135,10 @@ def webhook_event():
                 continue
             message = messaging.get("message", {})
             if message.get("attachments"):
-                # An image sent as a reply to our "where is this?" ask is an
-                # answer, not a new share — route it to the media handler.
-                reply_to_mid = (message.get("reply_to") or {}).get("mid")
-                pending = (
-                    store.get_pending_by_ask_msg(source.platform, reply_to_mid)
-                    if reply_to_mid else None
-                )
+                # An image answering our "where is this?" ask is not a new
+                # share — route it to the media handler instead of saving it
+                # as a destination against its own expiring CDN URL.
+                pending = _match_pending_ask(store, source, message, sender_id)
                 media_reply = (
                     source.build_media_reply_from_event(messaging)
                     if pending is not None else None

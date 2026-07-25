@@ -440,6 +440,58 @@ def test_deserialize_post_drops_unknown_keys():
     assert post.media_url is None
 
 
+# ── I4: the cron path must not silently log in to the private API ──────────
+
+def test_run_once_refuses_without_opt_in(monkeypatch):
+    """bot.run drives instagrapi; reaching it by accident re-breaks the account."""
+    from bot.run import run_once
+
+    monkeypatch.delenv("ALLOW_PRIVATE_API", raising=False)
+
+    with patch("bot.sources.instagram.InstagramSource") as mock_src, \
+         patch("bot.config.Config.load") as mock_load:
+        with pytest.raises(SystemExit) as exc:
+            run_once()
+
+    mock_src.assert_not_called()
+    mock_load.assert_not_called()
+    message = str(exc.value)
+    assert "private" in message.lower()
+    assert "ALLOW_PRIVATE_API=1" in message
+    assert "bot.webhook" in message
+
+
+def test_run_once_refuses_when_credentials_are_missing(monkeypatch):
+    """ig_username/ig_password are optional now — say so instead of failing opaquely."""
+    from bot.run import run_once
+
+    monkeypatch.setenv("ALLOW_PRIVATE_API", "1")
+    cfg = _make_cfg()
+    cfg.ig_username = None
+    cfg.ig_password = None
+
+    with patch("bot.sources.instagram.InstagramSource") as mock_src, \
+         patch("bot.config.Config.load", return_value=cfg):
+        with pytest.raises(SystemExit) as exc:
+            run_once()
+
+    mock_src.assert_not_called()
+    assert "IG_USERNAME" in str(exc.value)
+
+
+def test_instagram_source_rejects_missing_credentials():
+    """The typed contract said `str`, but Config now hands it `str | None`."""
+    from pathlib import Path
+    from bot.sources.instagram import InstagramSource
+
+    with patch("bot.sources.instagram.login_client") as login:
+        with pytest.raises(ValueError, match="IG_USERNAME"):
+            InstagramSource(username=None, password=None, allowed_sender_id="111",
+                            session_path=Path("/nonexistent/session.json"))
+
+    login.assert_not_called()
+
+
 def _make_pending(link="https://www.instagram.com/p/ABC/", ask_msg_id="ask_1"):
     return {"link": link, "caption_snippet": "snip", "ask_msg_id": ask_msg_id}
 

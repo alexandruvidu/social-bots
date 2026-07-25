@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sys
 from dataclasses import asdict, fields
 from types import SimpleNamespace
@@ -16,7 +17,6 @@ from .extract import (
     RateLimitedError,
     analyze_image,
     analyze_media,
-    analyze_video,
     is_success,
     extract,
 )
@@ -366,11 +366,38 @@ def drain_retry_queue(store, source: Source, cfg: Config) -> None:
         store.delete_retry(row["id"])
 
 
+PRIVATE_API_GUARD_TEXT = (
+    "Refusing to run: `bot.run` drives Instagram's PRIVATE API (instagrapi). It "
+    "logs in with IG_USERNAME/IG_PASSWORD, and that login is what got this "
+    "account forcibly logged out everywhere — it is the entire reason the bot "
+    "was moved to the official Messaging API.\n"
+    "\n"
+    "Run the webhook instead:  python -m bot.webhook\n"
+    "\n"
+    "If you really do mean to use the private API, opt in explicitly:\n"
+    "    ALLOW_PRIVATE_API=1 python -m bot.run"
+)
+
+PRIVATE_API_NO_CREDENTIALS_TEXT = (
+    "ALLOW_PRIVATE_API=1 is set, but IG_USERNAME and/or IG_PASSWORD are missing "
+    "from the environment. `bot.run` cannot log in without both. Set them in "
+    ".env, or drop ALLOW_PRIVATE_API and run `python -m bot.webhook`."
+)
+
+
 def run_once() -> None:
+    # Hard guard: nothing in the live pipeline calls this, and reaching it by
+    # accident (an old cron entry, muscle memory) re-creates the forced-logout
+    # problem this codebase was restructured to eliminate.
+    if os.environ.get("ALLOW_PRIVATE_API") != "1":
+        raise SystemExit(PRIVATE_API_GUARD_TEXT)
+
     from .sources.instagram import InstagramSource  # cron-only; not used by the webhook
     from .store import Store  # local import keeps config errors first
 
     cfg = Config.load()
+    if not cfg.ig_username or not cfg.ig_password:
+        raise SystemExit(PRIVATE_API_NO_CREDENTIALS_TEXT)
     store = Store(cfg.db_path)
     source = InstagramSource(
         username=cfg.ig_username,

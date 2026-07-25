@@ -59,9 +59,12 @@ class Source(Protocol):
     def fetch_new(self) -> tuple[list[SharedPost], list[TextReply]]:
         """Return (shared posts, plain-text replies) from trusted DM threads.
 
-        Implementations should enrich each SharedPost (caption/location/comments)
-        before returning. Items already in the `processed` table may still be
-        returned; the orchestrator filters them out.
+        Implementations populate whatever a SharedPost's own transport gives
+        them for free — the live webhook source sets `media_url`/`media_kind`
+        from the attachment and leaves caption/location/comments empty, since
+        fetching those would mean logging in to Instagram's private API. Items
+        already in the `processed` table may still be returned; the orchestrator
+        filters them out.
         """
         ...
 

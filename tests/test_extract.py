@@ -255,31 +255,108 @@ def test_analyze_media_dispatches_on_explicit_kind():
         img.assert_not_called()
 
 
-def test_analyze_media_sniffs_content_type_when_kind_unknown():
+def _download_returning(content_type, payload=b"DATA"):
+    """A _download_media stand-in that records the URLs it was asked to fetch."""
+    calls = []
+
+    def fake_download(url, dest):
+        calls.append(url)
+        dest.write_bytes(payload)
+        return content_type
+
+    return fake_download, calls
+
+
+def test_analyze_media_uses_download_content_type_when_kind_unknown():
+    """Instagram's `share` type covers photo posts; the download says which."""
     from unittest.mock import MagicMock, patch
-    from bot.extract import Extracted, analyze_media
+    from bot.extract import Extracted, SCREENSHOT_SYSTEM, analyze_media
 
-    head = MagicMock()
-    head.headers = {"content-type": "image/jpeg; charset=utf-8"}
+    client = MagicMock()
+    client.models.generate_content.return_value = MagicMock(
+        parsed=Extracted(destination="Lofoten, Norway", confidence=0.9)
+    )
+    fake_download, calls = _download_returning("image/jpeg", b"\xff\xd8\xffJPEG")
 
-    with patch("httpx.head", return_value=head), \
-         patch("bot.extract.analyze_image", return_value=Extracted()) as img, \
-         patch("bot.extract.analyze_video", return_value=Extracted()) as vid:
-        analyze_media("https://x/c", None, model="m")
+    with patch("bot.extract._download_media", side_effect=fake_download):
+        result = analyze_media("https://lookaside.fbsbx.com/c", None,
+                               model="m", client=client)
+
+    assert result.destination == "Lofoten, Norway"
+    # Analyzed inline as an image — never handed to the Files API as video/mp4.
+    client.files.upload.assert_not_called()
+    part = client.models.generate_content.call_args.kwargs["contents"][0]
+    assert part.inline_data.mime_type == "image/jpeg"
+    assert part.inline_data.data == b"\xff\xd8\xffJPEG"
+    cfg = client.models.generate_content.call_args.kwargs["config"]
+    assert cfg.system_instruction == SCREENSHOT_SYSTEM
+    # Downloaded exactly once: no HEAD sniff, no second fetch for the analyzer.
+    assert calls == ["https://lookaside.fbsbx.com/c"]
+
+
+def test_analyze_media_never_issues_a_head_request():
+    """Signed CDN URLs commonly reject HEAD, so we must not depend on one."""
+    from unittest.mock import patch
+    from bot.extract import analyze_media
+
+    fake_download, _ = _download_returning("image/jpeg")
+
+    with patch("httpx.head", side_effect=AssertionError("HEAD must not be issued")), \
+         patch("bot.extract._download_media", side_effect=fake_download), \
+         patch("bot.extract._analyze_image_file") as img:
+        analyze_media("https://x/c", None, model="m", client=object())
 
     img.assert_called_once()
-    vid.assert_not_called()
 
 
-def test_analyze_media_defaults_to_video_when_sniff_fails():
-    """Reels dominate the shares this bot sees, so an unknown type is a video."""
+def test_analyze_media_routes_video_content_type_to_video_analysis():
     from unittest.mock import patch
-    from bot.extract import Extracted, analyze_media
+    from bot.extract import analyze_media
 
-    with patch("httpx.head", side_effect=RuntimeError("network down")), \
-         patch("bot.extract.analyze_image", return_value=Extracted()) as img, \
-         patch("bot.extract.analyze_video", return_value=Extracted()) as vid:
-        analyze_media("https://x/d", None, model="m")
+    fake_download, calls = _download_returning("video/mp4")
+
+    with patch("bot.extract._download_media", side_effect=fake_download), \
+         patch("bot.extract._analyze_video_file") as vid, \
+         patch("bot.extract._analyze_image_file") as img:
+        analyze_media("https://x/d", None, model="m", client=object())
 
     vid.assert_called_once()
     img.assert_not_called()
+    assert len(calls) == 1
+
+
+def test_analyze_media_defaults_to_video_on_unrecognised_content_type():
+    """Reels dominate the shares this bot sees, so an unknown type is a video."""
+    from unittest.mock import patch
+    from bot.extract import analyze_media
+
+    fake_download, _ = _download_returning("application/octet-stream")
+
+    with patch("bot.extract._download_media", side_effect=fake_download), \
+         patch("bot.extract._analyze_video_file") as vid, \
+         patch("bot.extract._analyze_image_file") as img:
+        analyze_media("https://x/e", None, model="m", client=object())
+
+    vid.assert_called_once()
+    img.assert_not_called()
+
+
+def test_analyze_media_cleans_up_temp_file_on_exception():
+    """Every path unlinks the download, including the failing one."""
+    from pathlib import Path
+    from unittest.mock import patch
+    from bot.extract import analyze_media
+
+    seen = []
+
+    def fake_download(url, dest):
+        seen.append(Path(dest))
+        dest.write_bytes(b"DATA")
+        return "video/mp4"
+
+    with patch("bot.extract._download_media", side_effect=fake_download), \
+         patch("bot.extract._analyze_video_file", side_effect=RuntimeError("boom")):
+        with pytest.raises(RuntimeError, match="boom"):
+            analyze_media("https://x/f", None, model="m", client=object())
+
+    assert seen and not seen[0].exists()

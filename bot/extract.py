@@ -1,7 +1,13 @@
 """Destination extraction via the Google Gemini API (free tier, structured output).
 
-Feeds the post's geotag, caption, and top comments to Gemini and gets back a
-single normalized destination (or null when none is identifiable).
+Three entry points, one `Extracted` result shape:
+
+- `extract` — text only (geotag, caption, comments). Only the dormant
+  `instagrapi` path can supply those, so the live pipeline rarely uses it.
+- `analyze_media` — the live path: the media the official Messaging API webhook
+  delivered, dispatched to video or image analysis by the attachment's declared
+  kind, or by the download's Content-Type when the kind is unknown.
+- `analyze_image` — a screenshot the user sent to answer a failed extraction.
 
 Uses Gemini's JSON mode with a Pydantic response schema, so the model returns a
 validated `Extracted` object directly. Reads GEMINI_API_KEY from the environment.
@@ -194,6 +200,64 @@ def extract(
     return Extracted()
 
 
+# Fallback when the server doesn't tell us the image type. Gemini accepts
+# JPEG/PNG/WebP; JPEG is what Instagram screenshots almost always are.
+_IMAGE_MIME_DEFAULT = "image/jpeg"
+_VIDEO_MIME = "video/mp4"
+
+
+def _analyze_video_file(path: Path, *, model: str, client: "genai.Client") -> Extracted:
+    """Run video analysis on an already-downloaded file.
+
+    Split out from analyze_video so analyze_media can hand over a file it has
+    already fetched instead of downloading the same media a second time.
+    """
+    uploaded = client.files.upload(
+        file=path,
+        config=types.UploadFileConfig(mime_type=_VIDEO_MIME),
+    )
+    try:
+        _wait_for_active(client, uploaded.name)
+        video_part = types.Part.from_uri(file_uri=uploaded.uri, mime_type=_VIDEO_MIME)
+        config = types.GenerateContentConfig(
+            system_instruction=VIDEO_SYSTEM,
+            response_mime_type="application/json",
+            response_schema=Extracted,
+        )
+        resp = _generate_with_retry(client, model, [video_part], config)
+        parsed = getattr(resp, "parsed", None)
+        if isinstance(parsed, Extracted):
+            return parsed
+        return Extracted()
+    finally:
+        try:
+            client.files.delete(name=uploaded.name)
+        except Exception:
+            log.warning("Failed to delete Gemini file %s", uploaded.name, exc_info=True)
+
+
+def _analyze_image_file(
+    path: Path, content_type: str, *, model: str, client: "genai.Client"
+) -> Extracted:
+    """Run image analysis on an already-downloaded file, inline (no Files API)."""
+    mime = (
+        content_type
+        if isinstance(content_type, str) and content_type.startswith("image/")
+        else _IMAGE_MIME_DEFAULT
+    )
+    part = types.Part.from_bytes(data=path.read_bytes(), mime_type=mime)
+    config = types.GenerateContentConfig(
+        system_instruction=SCREENSHOT_SYSTEM,
+        response_mime_type="application/json",
+        response_schema=Extracted,
+    )
+    resp = _generate_with_retry(client, model, [part], config)
+    parsed = getattr(resp, "parsed", None)
+    if isinstance(parsed, Extracted):
+        return parsed
+    return Extracted()
+
+
 def analyze_video(
     video_url: str,
     *,
@@ -205,37 +269,9 @@ def analyze_video(
         tmp = Path(_tmp.name)
     try:
         _download_media(video_url, tmp)
-        uploaded = client.files.upload(
-            file=tmp,
-            config=types.UploadFileConfig(mime_type="video/mp4"),
-        )
-        try:
-            _wait_for_active(client, uploaded.name)
-            video_part = types.Part.from_uri(
-                file_uri=uploaded.uri, mime_type="video/mp4"
-            )
-            config = types.GenerateContentConfig(
-                system_instruction=VIDEO_SYSTEM,
-                response_mime_type="application/json",
-                response_schema=Extracted,
-            )
-            resp = _generate_with_retry(client, model, [video_part], config)
-            parsed = getattr(resp, "parsed", None)
-            if isinstance(parsed, Extracted):
-                return parsed
-            return Extracted()
-        finally:
-            try:
-                client.files.delete(name=uploaded.name)
-            except Exception:
-                log.warning("Failed to delete Gemini file %s", uploaded.name, exc_info=True)
+        return _analyze_video_file(tmp, model=model, client=client)
     finally:
         tmp.unlink(missing_ok=True)
-
-
-# Fallback when the server doesn't tell us the image type. Gemini accepts
-# JPEG/PNG/WebP; JPEG is what Instagram screenshots almost always are.
-_IMAGE_MIME_DEFAULT = "image/jpeg"
 
 
 def analyze_image(
@@ -255,18 +291,7 @@ def analyze_image(
         tmp = Path(_tmp.name)
     try:
         content_type = _download_media(image_url, tmp)
-        mime = content_type if content_type.startswith("image/") else _IMAGE_MIME_DEFAULT
-        part = types.Part.from_bytes(data=tmp.read_bytes(), mime_type=mime)
-        config = types.GenerateContentConfig(
-            system_instruction=SCREENSHOT_SYSTEM,
-            response_mime_type="application/json",
-            response_schema=Extracted,
-        )
-        resp = _generate_with_retry(client, model, [part], config)
-        parsed = getattr(resp, "parsed", None)
-        if isinstance(parsed, Extracted):
-            return parsed
-        return Extracted()
+        return _analyze_image_file(tmp, content_type, model=model, client=client)
     finally:
         tmp.unlink(missing_ok=True)
 
@@ -278,22 +303,33 @@ def analyze_media(
     model: str = "gemini-2.5-flash",
     client: "genai.Client | None" = None,
 ) -> Extracted:
-    """Dispatch to image or video analysis, sniffing the type when unknown."""
+    """Dispatch to image or video analysis, resolving the type when unknown."""
     if kind == "image":
         return analyze_image(media_url, model=model, client=client)
     if kind == "video":
         return analyze_video(media_url, model=model, client=client)
-    # Unknown: Instagram's `share` attachment type covers both. Ask the server.
-    import httpx
+    # Unknown kind — Instagram's `share` type covers ordinary photo posts as
+    # well as reels. Download once and let the response's own Content-Type
+    # decide. A separate HEAD sniff is not an option: signed CDN URLs commonly
+    # reject HEAD with 403/405, and treating that failure as "video" sends
+    # photo posts to the Files API tagged video/mp4, which just fails.
+    client = client or genai.Client()
+    with tempfile.NamedTemporaryFile(suffix=".bin", delete=False) as _tmp:
+        tmp = Path(_tmp.name)
     try:
-        head = httpx.head(media_url, follow_redirects=True, timeout=15.0)
-        content_type = head.headers.get("content-type", "").split(";")[0].strip().lower()
-    except Exception:  # noqa: BLE001
-        log.warning("Could not sniff media type for %s; assuming video.", media_url)
-        content_type = ""
-    if content_type.startswith("image/"):
-        return analyze_image(media_url, model=model, client=client)
-    return analyze_video(media_url, model=model, client=client)
+        content_type = _download_media(media_url, tmp)
+        if content_type.startswith("image/"):
+            return _analyze_image_file(tmp, content_type, model=model, client=client)
+        if not content_type.startswith("video/"):
+            # Reels dominate the shares this bot sees, so an unrecognised type
+            # is far likelier to be a video than an image.
+            log.warning(
+                "Unrecognised Content-Type %r for %s; treating as video.",
+                content_type, media_url,
+            )
+        return _analyze_video_file(tmp, model=model, client=client)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def _retry_delay_seconds(e: "genai_errors.APIError") -> Optional[float]:

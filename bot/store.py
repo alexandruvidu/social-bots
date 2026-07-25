@@ -31,14 +31,18 @@ CREATE TABLE IF NOT EXISTS processed (
     PRIMARY KEY (platform, item_id)
 );
 
+-- Keyed by a surrogate id with a unique index on (platform, ask_msg_id) rather
+-- than by (platform, thread_id): several asks can be outstanding at once in the
+-- same thread, and the old key made a second failed share silently destroy the
+-- first one's row.
 CREATE TABLE IF NOT EXISTS pending (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
     platform        TEXT NOT NULL,
     thread_id       TEXT NOT NULL,
     link            TEXT NOT NULL,
     caption_snippet TEXT,
     ask_msg_id      TEXT,
-    created_at      TEXT NOT NULL,
-    PRIMARY KEY (platform, thread_id)
+    created_at      TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS retry_queue (
@@ -66,13 +70,15 @@ class Store:
         # Migration: add ask_msg_id column if the DB predates it.
         try:
             self.conn.execute("ALTER TABLE pending ADD COLUMN ask_msg_id TEXT")
-            self.conn.execute(
-                "CREATE UNIQUE INDEX IF NOT EXISTS idx_pending_ask "
-                "ON pending (platform, ask_msg_id) WHERE ask_msg_id IS NOT NULL"
-            )
             self.conn.commit()
         except Exception:  # noqa: BLE001
             pass  # column already exists
+        self._migrate_pending_key()
+        self.conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_pending_ask "
+            "ON pending (platform, ask_msg_id) WHERE ask_msg_id IS NOT NULL"
+        )
+        self.conn.commit()
         # Migration: add landmark/place_type columns if the DB predates them.
         for ddl in (
             "ALTER TABLE destinations ADD COLUMN landmark TEXT",
@@ -87,6 +93,43 @@ class Store:
         self.conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_destinations_unique "
             "ON destinations (link, destination, COALESCE(landmark, ''))"
+        )
+        self.conn.commit()
+
+    def _migrate_pending_key(self) -> None:
+        """Rebuild `pending` if it still uses the old PRIMARY KEY (platform, thread_id).
+
+        That key allowed exactly one outstanding ask per thread, so sharing a
+        second unresolvable post replaced the first one's row — stranding post
+        #1 forever and making a reply to ask #1 resolve against post #2's link.
+        The table is now keyed by a surrogate `id`, with dedup handled by the
+        partial unique index on (platform, ask_msg_id).
+
+        Rows are carried over, not dropped: a live pending row is the only
+        record of a post the bot is still waiting on an answer for.
+        """
+        cols = self.conn.execute("PRAGMA table_info(pending)").fetchall()
+        if not cols or any(c["name"] == "id" for c in cols):
+            return  # fresh table from SCHEMA, or already migrated
+        self.conn.executescript(
+            """
+            CREATE TABLE pending_new (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                platform        TEXT NOT NULL,
+                thread_id       TEXT NOT NULL,
+                link            TEXT NOT NULL,
+                caption_snippet TEXT,
+                ask_msg_id      TEXT,
+                created_at      TEXT NOT NULL
+            );
+            INSERT INTO pending_new
+                (platform, thread_id, link, caption_snippet, ask_msg_id, created_at)
+            SELECT platform, thread_id, link, caption_snippet, ask_msg_id, created_at
+            FROM pending
+            ORDER BY created_at;
+            DROP TABLE pending;
+            ALTER TABLE pending_new RENAME TO pending;
+            """
         )
         self.conn.commit()
 
@@ -208,8 +251,25 @@ class Store:
         caption_snippet: str | None,
         ask_msg_id: str | None = None,
     ) -> None:
+        """Record a post awaiting an answer. Several may be open per thread.
+
+        A row is replaced only by another ask carrying the same `ask_msg_id`.
+        Rows with no ask id can only ever be matched by thread, so there is
+        still at most one of those per thread — the pre-re-key behaviour.
+        """
+        if ask_msg_id:
+            self.conn.execute(
+                "DELETE FROM pending WHERE platform = ? AND ask_msg_id = ?",
+                (platform, ask_msg_id),
+            )
+        else:
+            self.conn.execute(
+                "DELETE FROM pending WHERE platform = ? AND thread_id = ? "
+                "AND (ask_msg_id IS NULL OR ask_msg_id = '')",
+                (platform, thread_id),
+            )
         self.conn.execute(
-            """INSERT OR REPLACE INTO pending
+            """INSERT INTO pending
                (platform, thread_id, link, caption_snippet, ask_msg_id, created_at)
                VALUES (?, ?, ?, ?, ?, ?)""",
             (platform, thread_id, link, caption_snippet, ask_msg_id, _now()),
@@ -217,8 +277,15 @@ class Store:
         self.conn.commit()
 
     def get_pending(self, platform: str, thread_id: str) -> Optional[sqlite3.Row]:
+        """The most recently opened pending row for a thread.
+
+        Used when a reply doesn't quote a specific ask, in which case the
+        newest outstanding question is the one the user is most likely
+        answering.
+        """
         return self.conn.execute(
-            "SELECT * FROM pending WHERE platform = ? AND thread_id = ?",
+            "SELECT * FROM pending WHERE platform = ? AND thread_id = ? "
+            "ORDER BY created_at DESC, id DESC LIMIT 1",
             (platform, thread_id),
         ).fetchone()
 
@@ -229,8 +296,16 @@ class Store:
         ).fetchone()
 
     def clear_pending(self, platform: str, thread_id: str) -> None:
+        """Clear the thread's ask-less pending row (the one keyed only by thread).
+
+        Deliberately does NOT touch rows that carry an ask_msg_id: those are
+        separate outstanding questions and are closed via
+        clear_pending_by_ask_msg. Callers reach this only when the row they
+        matched had no ask id, so it is exactly that row being cleared.
+        """
         self.conn.execute(
-            "DELETE FROM pending WHERE platform = ? AND thread_id = ?",
+            "DELETE FROM pending WHERE platform = ? AND thread_id = ? "
+            "AND (ask_msg_id IS NULL OR ask_msg_id = '')",
             (platform, thread_id),
         )
         self.conn.commit()

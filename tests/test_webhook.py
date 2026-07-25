@@ -183,6 +183,130 @@ def test_enrich_from_url_calls_build_post_on_success():
     assert call_args.args[2].pk == "12345"
 
 
+# ── C1: attachment routing (share vs. answer-to-an-ask) ────────────────────
+#
+# A screenshot is normally sent as a plain message, not as a formal reply, so
+# routing must not hinge on reply_to. It hinges on the attachment type plus
+# whether an ask is open in the thread.
+
+def _route_attachment(atype, url, *, reply_to_mid=None,
+                      pending_by_ask=None, pending_by_thread=None):
+    """Drive one attachment event through the webhook's routing.
+
+    Returns (source, store, handle_posts mock, handle_media_replies mock).
+    """
+    from unittest.mock import MagicMock, patch
+    import json as _json
+    import bot.webhook as wh
+
+    cfg = MagicMock()
+    cfg.ig_user_id = "999"
+    cfg.allowed_sender_id = "111"
+    source = MagicMock()
+    source.platform = "instagram"
+    store = MagicMock()
+    store.get_pending_by_ask_msg.return_value = pending_by_ask
+    store.get_pending.return_value = pending_by_thread
+
+    message = {"mid": "m1", "attachments": [{"type": atype, "payload": {"url": url}}]}
+    if reply_to_mid:
+        message["reply_to"] = {"mid": reply_to_mid}
+    body = {"object": "instagram",
+            "entry": [{"messaging": [{"sender": {"id": "111"}, "message": message}]}]}
+
+    wh._components = (cfg, source, store)
+    try:
+        with patch("bot.webhook.verify_signature", return_value=True), \
+             patch("bot.webhook.handle_posts") as posts, \
+             patch("bot.webhook.handle_replies"), \
+             patch("bot.webhook.handle_media_replies") as media:
+            wh.app.test_client().post("/webhook", data=_json.dumps(body),
+                                      content_type="application/json")
+            return source, store, posts, media
+    finally:
+        wh._components = None
+
+
+_PENDING = {"link": "https://www.instagram.com/p/REAL/", "caption_snippet": None,
+            "ask_msg_id": "ask_1"}
+
+
+def test_plain_image_with_open_pending_routes_to_media_handler():
+    """The normal screenshot gesture: a photo, no reply_to, ask still open.
+
+    Before the fix this fell through to build_post_from_event and was saved as
+    a brand-new destination against the screenshot's expiring CDN URL, while
+    the real post's pending row was never resolved.
+    """
+    source, store, posts, media = _route_attachment(
+        "image", "https://lookaside.fbsbx.com/shot", pending_by_thread=_PENDING,
+    )
+
+    store.get_pending.assert_called_once_with("instagram", "111")
+    source.build_media_reply_from_event.assert_called_once()
+    source.build_post_from_event.assert_not_called()
+    assert media.call_args.args[2] != []
+    assert posts.call_args.args[2] == []
+
+
+def test_plain_image_without_pending_routes_to_post_handler():
+    """An image with no ask open is still an ordinary share — unchanged."""
+    source, store, posts, media = _route_attachment(
+        "image", "https://lookaside.fbsbx.com/photo", pending_by_thread=None,
+    )
+
+    source.build_post_from_event.assert_called_once()
+    source.build_media_reply_from_event.assert_not_called()
+    assert media.call_args.args[2] == []
+
+
+def test_shared_reel_with_open_pending_still_routes_to_post_handler():
+    """A reel shared while an ask is open must NOT be eaten as the answer."""
+    source, store, posts, media = _route_attachment(
+        "ig_reel", "https://www.instagram.com/reel/XYZ/", pending_by_thread=_PENDING,
+    )
+
+    # A non-image attachment must not even consult the thread's pending row.
+    store.get_pending.assert_not_called()
+    source.build_post_from_event.assert_called_once()
+    source.build_media_reply_from_event.assert_not_called()
+    assert media.call_args.args[2] == []
+
+
+def test_share_attachment_with_open_pending_still_routes_to_post_handler():
+    """Ordinary photo posts arrive as `share`, not `image` — also a post."""
+    source, store, posts, media = _route_attachment(
+        "share", "https://lookaside.fbsbx.com/asset", pending_by_thread=_PENDING,
+    )
+
+    store.get_pending.assert_not_called()
+    source.build_post_from_event.assert_called_once()
+    source.build_media_reply_from_event.assert_not_called()
+
+
+def test_reply_to_a_pending_ask_wins_over_attachment_type():
+    """The formal quote-reply path is checked first and is type-agnostic."""
+    source, store, posts, media = _route_attachment(
+        "video", "https://lookaside.fbsbx.com/clip", reply_to_mid="ask_1",
+        pending_by_ask=_PENDING,
+    )
+
+    store.get_pending_by_ask_msg.assert_called_once_with("instagram", "ask_1")
+    source.build_media_reply_from_event.assert_called_once()
+    source.build_post_from_event.assert_not_called()
+
+
+def test_image_quoting_an_unknown_message_falls_back_to_thread_pending():
+    """reply_to naming something that isn't an ask must not lose the answer."""
+    source, store, posts, media = _route_attachment(
+        "image", "https://lookaside.fbsbx.com/shot", reply_to_mid="not_an_ask",
+        pending_by_ask=None, pending_by_thread=_PENDING,
+    )
+
+    source.build_media_reply_from_event.assert_called_once()
+    source.build_post_from_event.assert_not_called()
+
+
 # ── HMAC verification ──────────────────────────────────────────────────────
 
 def test_verify_signature_valid():
@@ -212,7 +336,7 @@ def test_verify_signature_wrong_prefix():
 # ── GET /webhook verification route ───────────────────────────────────────
 
 @pytest.fixture
-def flask_client(monkeypatch):
+def flask_client(monkeypatch, tmp_path):
     monkeypatch.setenv("IG_USERNAME", "u")
     monkeypatch.setenv("IG_PASSWORD", "p")
     monkeypatch.setenv("ALLOWED_SENDER_ID", "111")
@@ -221,8 +345,12 @@ def flask_client(monkeypatch):
     monkeypatch.setenv("IG_APP_SECRET", "appsecret")
     monkeypatch.setenv("WEBHOOK_VERIFY_TOKEN", "myverifytoken")
     monkeypatch.setenv("IG_USER_ID", "bot999")
+    # The reload below restores the real _build_components, so a request that
+    # gets past the patch opens a real sqlite file and runs Store's migrations
+    # against it. Keep that off the user's data/db.sqlite.
+    monkeypatch.setenv("DB_PATH", str(tmp_path / "test.sqlite"))
 
-    # Prevent real Instagram login during test setup
+    # Components are stubbed out so no request reaches a live source or store.
     from unittest.mock import patch as _patch, MagicMock
     with _patch("bot.webhook._build_components") as mock_build:
         from bot.config import Config

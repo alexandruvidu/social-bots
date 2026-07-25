@@ -1,5 +1,10 @@
 """Instagram Source backed by the unofficial `instagrapi` private-API client.
 
+DORMANT. Nothing in the live pipeline imports this module: constructing this
+class logs in to Instagram's private API, which is what got the bot account
+forcibly logged out everywhere. It is kept on disk so the change is reversible,
+and is reachable only via `bot.run` with ALLOW_PRIVATE_API=1 explicitly set.
+
 Reads DM threads, pulls shared posts/reels from the trusted sender, enriches each
 with caption + geotag + top comments, and exposes plain-text replies (used to
 resolve a failed extraction).
@@ -193,14 +198,23 @@ class InstagramSource(Source):
 
     def __init__(
         self,
-        username: str,
-        password: str,
+        username: str | None,
+        password: str | None,
         allowed_sender_id: str,
         session_path: Path,
         comments_limit: int = 25,
         comments_fetch_limit: int = 100,
         threads_amount: int = 20,
     ):
+        # Config.ig_username/ig_password are optional (the live webhook path
+        # never logs in), so they can legitimately be None here. Say so plainly
+        # rather than handing None to client.login() and failing opaquely.
+        if not username or not password:
+            raise ValueError(
+                "InstagramSource requires both a username and a password "
+                "(IG_USERNAME / IG_PASSWORD); got username=%r, password=%s."
+                % (username, "set" if password else "missing")
+            )
         self.allowed_sender_id = str(allowed_sender_id)
         self.comments_limit = comments_limit
         self.comments_fetch_limit = max(comments_fetch_limit, comments_limit)
