@@ -5,13 +5,12 @@ import pytest
 from bot.sources.base import SharedPost, TextReply
 
 
-def _make_source(enrich=None):
+def _make_source():
     from bot.sources.instagram_api import InstagramAPISource
     return InstagramAPISource(
         access_token="tok",
         ig_user_id="bot999",
         allowed_sender_id="sender111",
-        enrich_source=enrich,
     )
 
 
@@ -64,27 +63,6 @@ def test_build_post_from_event_ig_reel():
     assert post.item_id == "msg_abc"
     assert post.thread_id == "sender111"
     assert post.link == "https://www.instagram.com/reel/XYZ/"
-
-
-def test_build_post_from_event_calls_enrich():
-    enriched = SharedPost(
-        platform="instagram", item_id="msg_abc", thread_id="sender111",
-        link="https://www.instagram.com/reel/XYZ/", caption="nice place"
-    )
-    enrich = MagicMock()
-    enrich.enrich_from_url.return_value = enriched
-    src = _make_source(enrich=enrich)
-
-    messaging = {
-        "sender": {"id": "sender111"},
-        "message": {
-            "mid": "msg_abc",
-            "attachments": [{"type": "ig_reel", "payload": {"url": "https://www.instagram.com/reel/XYZ/"}}],
-        },
-    }
-    post = src.build_post_from_event(messaging)
-    assert post.caption == "nice place"
-    enrich.enrich_from_url.assert_called_once_with("msg_abc", "sender111", "https://www.instagram.com/reel/XYZ/")
 
 
 def test_build_post_from_event_unknown_type_returns_none():
@@ -143,3 +121,64 @@ def test_build_reply_from_event_empty_text_returns_none():
         "message": {"mid": "msg_xyz"},
     }
     assert src.build_reply_from_event(messaging) is None
+
+
+def _src():
+    from bot.sources.instagram_api import InstagramAPISource
+    return InstagramAPISource(access_token="t", ig_user_id="999", allowed_sender_id="111")
+
+
+def _event(atype, url, reply_to_mid=None):
+    message = {"mid": "msg_abc", "attachments": [{"type": atype, "payload": {"url": url}}]}
+    if reply_to_mid:
+        message["reply_to"] = {"mid": reply_to_mid}
+    return {"sender": {"id": "111"}, "message": message}
+
+
+def test_permalink_payload_yields_post_with_no_media():
+    post = _src().build_post_from_event(_event("ig_reel", "https://www.instagram.com/reel/XYZ/"))
+    assert post.link == "https://www.instagram.com/reel/XYZ/"
+    assert post.media_url is None
+    assert post.media_kind is None
+
+
+def test_cdn_payload_yields_post_with_media_url():
+    url = "https://lookaside.fbsbx.com/ig_messaging_cdn/?asset_id=1&signature=s"
+    post = _src().build_post_from_event(_event("ig_reel", url))
+    assert post.media_url == url
+    assert post.media_kind == "video"
+
+
+def test_share_attachment_leaves_media_kind_unknown():
+    url = "https://lookaside.fbsbx.com/ig_messaging_cdn/?asset_id=2"
+    post = _src().build_post_from_event(_event("share", url))
+    assert post.media_url == url
+    assert post.media_kind is None
+
+
+def test_image_attachment_kind_is_image():
+    url = "https://lookaside.fbsbx.com/ig_messaging_cdn/?asset_id=3"
+    post = _src().build_post_from_event(_event("image", url))
+    assert post.media_kind == "image"
+
+
+def test_build_post_never_calls_instagrapi():
+    """The whole point: no enrichment hook exists on this source any more."""
+    src = _src()
+    assert not hasattr(src, "_enrich")
+
+
+def test_build_media_reply_from_event_carries_reply_to():
+    url = "https://lookaside.fbsbx.com/ig_messaging_cdn/?asset_id=4"
+    reply = _src().build_media_reply_from_event(_event("image", url, reply_to_mid="ask_1"))
+    assert reply.media_url == url
+    assert reply.reply_to_item_id == "ask_1"
+    assert reply.thread_id == "111"
+
+
+def test_build_media_reply_rejects_permalink():
+    """A shared post is not an answer to an ask, even as a reply."""
+    reply = _src().build_media_reply_from_event(
+        _event("ig_reel", "https://www.instagram.com/reel/XYZ/", reply_to_mid="ask_1")
+    )
+    assert reply is None

@@ -50,7 +50,6 @@ def _build_components() -> tuple[Config, InstagramAPISource, Store]:
         access_token=cfg.ig_access_token or "",
         ig_user_id=cfg.ig_user_id or "",
         allowed_sender_id=cfg.allowed_sender_id,
-        enrich_source=enrich,
     )
     store = Store(cfg.db_path)
     return cfg, source, store
