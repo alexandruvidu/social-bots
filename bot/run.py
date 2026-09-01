@@ -21,6 +21,7 @@ from .extract import (
     extract,
 )
 from .sources.base import MediaReply, PostComment, SharedPost, Source, TextReply
+from .trek import push_destination
 
 log = logging.getLogger("bot")
 
@@ -42,6 +43,8 @@ MEDIA_RATE_LIMIT_TEXT = (
     "I'm rate-limited right now — send that screenshot again in a few minutes, "
     "or just type the place name."
 )
+
+TREK_SYNC_FAILED_TEXT = "Couldn't sync to TREK — saved locally only."
 
 
 def _snippet(caption: str | None, n: int = 200) -> str | None:
@@ -88,7 +91,7 @@ def _format_result_text(saved_places: list, existing_places: list, link: str) ->
     return "\n".join(lines)
 
 
-def handle_replies(store, source: Source, replies: list[TextReply]) -> None:
+def handle_replies(store, source: Source, replies: list[TextReply], cfg: Config) -> None:
     for reply in replies:
         if store.is_processed(reply.platform, reply.item_id):
             continue
@@ -120,6 +123,21 @@ def handle_replies(store, source: Source, replies: list[TextReply]) -> None:
                 pending["link"],
                 saved,
             )
+            if saved and cfg.trek_url and cfg.trek_api_token:
+                ok = push_destination(
+                    cfg,
+                    platform=reply.platform,
+                    link=pending["link"],
+                    destination=reply.text,
+                    landmark=None,
+                    place_type=None,
+                    topic=None,
+                    caption_snippet=pending["caption_snippet"],
+                )
+                if not ok:
+                    source.reply(
+                        reply.thread_id, TREK_SYNC_FAILED_TEXT, reply_to_item_id=reply.item_id
+                    )
         # Mark processed whether or not it resolved a pending row, so a chatty
         # thread doesn't get re-scanned forever.
         store.mark_processed(reply.platform, reply.item_id)
@@ -162,7 +180,7 @@ def handle_media_replies(store, source: Source, media_replies: list[MediaReply],
             store.mark_processed(reply.platform, reply.item_id)
             continue
 
-        saved_places, existing_places = _save_places(
+        saved_places, existing_places, trek_failed = _save_places(
             store, source,
             platform=reply.platform,
             link=pending["link"],
@@ -177,9 +195,12 @@ def handle_media_replies(store, source: Source, media_replies: list[MediaReply],
             store.clear_pending_by_ask_msg(reply.platform, ask_msg_id)
         else:
             store.clear_pending(reply.platform, reply.thread_id)
+        reply_text = _format_result_text(saved_places, existing_places, pending["link"])
+        if trek_failed:
+            reply_text += f"\n{TREK_SYNC_FAILED_TEXT}"
         source.reply(
             reply.thread_id,
-            _format_result_text(saved_places, existing_places, pending["link"]),
+            reply_text,
             reply_to_item_id=reply.item_id,
         )
         store.mark_processed(reply.platform, reply.item_id)
@@ -209,17 +230,19 @@ def _deserialize_post(payload: str) -> SharedPost:
 
 def _save_places(store, source: Source, *, platform: str, link: str, result,
                  caption_snippet: str | None, cfg: Config,
-                 source_field: str | None = None) -> tuple[list, list]:
-    """Save the extracted place(s) for `link`.
+                 source_field: str | None = None) -> tuple[list, list, bool]:
+    """Save the extracted place(s) for `link`, and push new ones to TREK if configured.
 
-    Returns (newly_saved, already_present). `source_field` overrides whatever
-    Gemini reported — the screenshot path always attributes to "screenshot".
+    Returns (newly_saved, already_present, trek_failed). `source_field`
+    overrides whatever Gemini reported — the screenshot path always
+    attributes to "screenshot".
     """
     places = [result] + [
         p for p in result.more_places if is_success(p, cfg.confidence_threshold)
     ]
     saved_places = []
     existing_places = []
+    trek_failed = False
     for place in places:
         field = source_field or place.source_field
         saved = store.save_destination(
@@ -240,9 +263,22 @@ def _save_places(store, source: Source, *, platform: str, link: str, result,
         )
         if saved:
             saved_places.append(place)
+            if cfg.trek_url and cfg.trek_api_token:
+                ok = push_destination(
+                    cfg,
+                    platform=platform,
+                    link=link,
+                    destination=place.destination,
+                    landmark=place.landmark,
+                    place_type=place.place_type,
+                    topic=place.topic,
+                    caption_snippet=caption_snippet,
+                )
+                if not ok:
+                    trek_failed = True
         else:
             existing_places.append(place)
-    return saved_places, existing_places
+    return saved_places, existing_places, trek_failed
 
 
 def _process_post(store, source: Source, post: SharedPost, cfg: Config) -> None:
@@ -270,12 +306,14 @@ def _process_post(store, source: Source, post: SharedPost, cfg: Config) -> None:
         store.mark_processed(post.platform, post.item_id)
         return
     try:
-        # With enrichment gone, a live post has no caption/location/comments —
-        # only the media the official webhook handed us. Skip the text call
-        # entirely rather than spending a Gemini request on an empty prompt.
+        # A public permalink may be enriched with caption, geotag, and selected
+        # comments. Send every available text signal together: Gemini's system
+        # prompt ranks creator comments below the creator-authored caption and
+        # geotag, and one call is both faster and cheaper than a comments retry.
+        # CDN-only webhook events may have only media, so skip an empty text call.
         result = Extracted()
-        if post.caption or post.location:
-            result = extract(post.caption, post.location, [], model=cfg.model)
+        if post.caption or post.location or post.comments:
+            result = extract(post.caption, post.location, post.comments, model=cfg.model)
         if not is_success(result, cfg.confidence_threshold) and post.media_url:
             log.info("Analyzing media for %s (kind=%s)", post.link, post.media_kind)
             try:
@@ -284,11 +322,8 @@ def _process_post(store, source: Source, post: SharedPost, cfg: Config) -> None:
                 raise
             except Exception:
                 log.warning("Media analysis failed for %s.", post.link, exc_info=True)
-        if not is_success(result, cfg.confidence_threshold) and post.comments:
-            log.info("Media analysis failed; trying comments-augmented extraction for %s", post.link)
-            result = extract(post.caption, post.location, post.comments, model=cfg.model)
         if is_success(result, cfg.confidence_threshold):
-            saved_places, existing_places = _save_places(
+            saved_places, existing_places, trek_failed = _save_places(
                 store, source,
                 platform=post.platform,
                 link=post.link,
@@ -297,9 +332,12 @@ def _process_post(store, source: Source, post: SharedPost, cfg: Config) -> None:
                 cfg=cfg,
             )
             if saved_places or existing_places:
+                reply_text = _format_result_text(saved_places, existing_places, post.link)
+                if trek_failed:
+                    reply_text += f"\n{TREK_SYNC_FAILED_TEXT}"
                 source.reply(
                     post.thread_id,
-                    _format_result_text(saved_places, existing_places, post.link),
+                    reply_text,
                     reply_to_item_id=post.item_id,
                 )
         else:
@@ -411,7 +449,7 @@ def run_once() -> None:
         posts, replies = source.fetch_new()
         log.info("Fetched %d shared posts, %d replies.", len(posts), len(replies))
         # Replies first: a reply may resolve a pending row created last run.
-        handle_replies(store, source, replies)
+        handle_replies(store, source, replies, cfg)
         handle_posts(store, source, posts, cfg)
         drain_retry_queue(store, source, cfg)
     finally:

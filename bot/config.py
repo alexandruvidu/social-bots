@@ -51,6 +51,9 @@ class Config:
     webhook_verify_token: str | None = None
     ig_user_id: str | None = None
     meta_app_id: str | None = None
+    instaloader_enrichment: bool = True
+    trek_url: str | None = None
+    trek_api_token: str | None = None
 
     @staticmethod
     def load() -> "Config":
@@ -73,8 +76,11 @@ class Config:
             webhook_verify_token=os.environ.get("WEBHOOK_VERIFY_TOKEN"),
             ig_user_id=os.environ.get("IG_USER_ID"),
             meta_app_id=os.environ.get("META_APP_ID"),
+            instaloader_enrichment=os.environ.get("INSTALOADER_ENRICHMENT", "1") != "0",
             ig_username=os.environ.get("IG_USERNAME"),
             ig_password=os.environ.get("IG_PASSWORD"),
+            trek_url=os.environ.get("TREK_URL"),
+            trek_api_token=os.environ.get("TREK_API_TOKEN"),
         )
 
 

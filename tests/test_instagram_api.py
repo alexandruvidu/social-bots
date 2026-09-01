@@ -128,8 +128,11 @@ def _src():
     return InstagramAPISource(access_token="t", ig_user_id="999", allowed_sender_id="111")
 
 
-def _event(atype, url, reply_to_mid=None):
-    message = {"mid": "msg_abc", "attachments": [{"type": atype, "payload": {"url": url}}]}
+def _event(atype, url, reply_to_mid=None, title=None):
+    payload = {"url": url}
+    if title is not None:
+        payload["title"] = title
+    message = {"mid": "msg_abc", "attachments": [{"type": atype, "payload": payload}]}
     if reply_to_mid:
         message["reply_to"] = {"mid": reply_to_mid}
     return {"sender": {"id": "111"}, "message": message}
@@ -140,6 +143,56 @@ def test_permalink_payload_yields_post_with_no_media():
     assert post.link == "https://www.instagram.com/reel/XYZ/"
     assert post.media_url is None
     assert post.media_kind is None
+
+
+def test_permalink_can_be_enriched_without_instagrapi():
+    from bot.sources.instagram_api import InstagramAPISource
+    from instagram_downloader import DownloadedComment, DownloadedPost
+
+    loader = MagicMock(return_value=DownloadedPost(
+        caption="A week in Kyoto",
+        location="Arashiyama",
+        comments=[DownloadedComment("Location: Kyoto, Japan", is_creator=True, likes=7)],
+        media_url="https://cdn.instagram.com/reel.mp4",
+        media_kind="video",
+    ))
+    src = InstagramAPISource(
+        access_token="tok",
+        ig_user_id="bot999",
+        allowed_sender_id="sender111",
+        enable_instaloader_enrichment=True,
+        comments_limit=25,
+        comments_fetch_limit=100,
+        post_metadata_loader=loader,
+    )
+    post = src.build_post_from_event(_event("ig_reel", "https://www.instagram.com/reel/XYZ/"))
+
+    loader.assert_called_once_with(
+        "https://www.instagram.com/reel/XYZ/", comments_limit=25, comments_fetch_limit=100
+    )
+    assert post.caption == "A week in Kyoto"
+    assert post.location == "Arashiyama"
+    assert post.comments[0].is_creator is True
+    assert post.media_url == "https://cdn.instagram.com/reel.mp4"
+    assert post.media_kind == "video"
+
+
+def test_permalink_enrichment_failure_keeps_webhook_title():
+    from bot.sources.instagram_api import InstagramAPISource
+    src = InstagramAPISource(
+        access_token="tok",
+        ig_user_id="bot999",
+        allowed_sender_id="sender111",
+        enable_instaloader_enrichment=True,
+        post_metadata_loader=MagicMock(side_effect=Exception("login wall")),
+    )
+    post = src.build_post_from_event(_event(
+        "ig_reel", "https://www.instagram.com/reel/XYZ/", title="Sunset in Santorini"
+    ))
+
+    assert post.caption == "Sunset in Santorini"
+    assert post.location is None
+    assert post.comments == []
 
 
 def test_cdn_payload_yields_post_with_media_url():
@@ -182,3 +235,38 @@ def test_build_media_reply_rejects_permalink():
         _event("ig_reel", "https://www.instagram.com/reel/XYZ/", reply_to_mid="ask_1")
     )
     assert reply is None
+
+
+def test_ig_post_attachment_is_recognized():
+    """ig_post replaces the deprecated `share` type for feed-post shares."""
+    post = _src().build_post_from_event(
+        _event("ig_post", "https://www.instagram.com/p/XYZ/")
+    )
+    assert post is not None
+    assert post.link == "https://www.instagram.com/p/XYZ/"
+
+
+def test_ig_post_media_kind_unknown():
+    url = "https://lookaside.fbsbx.com/ig_messaging_cdn/?asset_id=5"
+    post = _src().build_post_from_event(_event("ig_post", url))
+    assert post.media_url == url
+    assert post.media_kind is None
+
+
+def test_title_populates_caption_for_ig_reel():
+    post = _src().build_post_from_event(
+        _event("ig_reel", "https://www.instagram.com/reel/XYZ/", title="Sunset in Santorini")
+    )
+    assert post.caption == "Sunset in Santorini"
+
+
+def test_title_populates_caption_for_ig_post():
+    post = _src().build_post_from_event(
+        _event("ig_post", "https://www.instagram.com/p/XYZ/", title="Best tacos in Mexico City")
+    )
+    assert post.caption == "Best tacos in Mexico City"
+
+
+def test_missing_title_leaves_caption_none():
+    post = _src().build_post_from_event(_event("image", "https://lookaside.fbsbx.com/?asset_id=6"))
+    assert post.caption is None

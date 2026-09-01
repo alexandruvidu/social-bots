@@ -40,6 +40,9 @@ def _build_components() -> tuple[Config, InstagramAPISource, Store]:
         access_token=cfg.ig_access_token or "",
         ig_user_id=cfg.ig_user_id or "",
         allowed_sender_id=cfg.allowed_sender_id,
+        enable_instaloader_enrichment=cfg.instaloader_enrichment,
+        comments_limit=cfg.comments_limit,
+        comments_fetch_limit=cfg.comments_fetch_limit,
     )
     store = Store(cfg.db_path)
     return cfg, source, store
@@ -164,7 +167,7 @@ def webhook_event():
         "Webhook batch: %d post(s), %d reply(ies), %d screenshot(s) to process.",
         len(posts), len(replies), len(media_replies),
     )
-    handle_replies(store, source, replies)
+    handle_replies(store, source, replies, cfg)
     handle_media_replies(store, source, media_replies, cfg)
     handle_posts(store, source, posts, cfg)
     return "ok", 200
@@ -177,6 +180,9 @@ def _retry_loop() -> None:
         access_token=cfg.ig_access_token or "",
         ig_user_id=cfg.ig_user_id or "",
         allowed_sender_id=cfg.allowed_sender_id,
+        enable_instaloader_enrichment=cfg.instaloader_enrichment,
+        comments_limit=cfg.comments_limit,
+        comments_fetch_limit=cfg.comments_fetch_limit,
     )
     while True:
         time.sleep(RETRY_POLL_INTERVAL)

@@ -3,8 +3,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from bot.run import drain_retry_queue, handle_posts
-from bot.sources.base import PostComment, SharedPost
+from bot.run import drain_retry_queue, handle_posts, handle_replies
+from bot.sources.base import PostComment, SharedPost, TextReply
 
 
 def _make_post(media_url=None, media_kind=None, comments=None):
@@ -24,6 +24,8 @@ def _make_cfg(threshold=0.4):
     cfg = MagicMock()
     cfg.confidence_threshold = threshold
     cfg.model = "gemini-2.5-flash"
+    cfg.trek_url = None
+    cfg.trek_api_token = None
     return cfg
 
 
@@ -95,9 +97,7 @@ def test_video_fallback_not_called_when_no_media_url():
     source.reply.assert_called_once()
 
 
-def test_extract_called_without_comments_first():
-    """Comments are an unreliable, risk-laden signal — caption/location alone
-    is tried first so a clean post never needs them at all."""
+def test_extract_receives_all_available_text_signals_in_one_call():
     from bot.extract import Extracted
 
     store = _make_store()
@@ -112,11 +112,11 @@ def test_extract_called_without_comments_first():
          patch("bot.run.analyze_media") as mock_media:
         handle_posts(store, source, [post], cfg)
 
-    mock_extract.assert_called_once_with(post.caption, post.location, [], model=cfg.model)
+    mock_extract.assert_called_once_with(post.caption, post.location, post.comments, model=cfg.model)
     mock_media.assert_not_called()
 
 
-def test_video_tried_before_comments_when_caption_extraction_fails():
+def test_video_is_tried_after_all_text_signals_fail():
     from bot.extract import Extracted
 
     store = _make_store()
@@ -136,13 +136,13 @@ def test_video_tried_before_comments_when_caption_extraction_fails():
         handle_posts(store, source, [post], cfg)
 
     mock_media.assert_called_once_with("https://cdn.instagram.com/video.mp4", None, model=cfg.model)
-    # Video succeeded, so the comments-augmented retry never had to run.
+    # Video succeeded, and there was only one text extraction call.
     assert mock_extract.call_count == 1
     saved_kwargs = store.save_destination.call_args.kwargs
     assert saved_kwargs["destination"] == "Bali, Indonesia"
 
 
-def test_falls_back_to_comments_when_caption_and_video_both_fail():
+def test_comments_are_not_sent_in_a_second_gemini_call():
     from bot.extract import Extracted
 
     store = _make_store()
@@ -153,24 +153,13 @@ def test_falls_back_to_comments_when_caption_and_video_both_fail():
     post = _make_post(media_url="https://cdn.instagram.com/video.mp4", comments=comments)
 
     low_confidence = Extracted(destination=None, confidence=0.0)
-    comments_success = Extracted(destination="Lisbon, Portugal", confidence=0.9, source_field="comments")
-
-    def fake_extract(caption, location, post_comments, model=None):
-        if post_comments:
-            return comments_success
-        return low_confidence
-
-    with patch("bot.run.extract", side_effect=fake_extract) as mock_extract, \
+    with patch("bot.run.extract", return_value=low_confidence) as mock_extract, \
          patch("bot.run.analyze_media", return_value=low_confidence) as mock_media:
         handle_posts(store, source, [post], cfg)
 
     mock_media.assert_called_once()
-    assert mock_extract.call_count == 2
-    first_call, second_call = mock_extract.call_args_list
-    assert first_call.args[2] == []
-    assert second_call.args[2] == comments
-    saved_kwargs = store.save_destination.call_args.kwargs
-    assert saved_kwargs["destination"] == "Lisbon, Portugal"
+    mock_extract.assert_called_once_with(post.caption, post.location, comments, model=cfg.model)
+    source.reply.assert_called_once()
 
 
 def test_no_comments_retry_when_post_has_no_comments():
@@ -616,3 +605,152 @@ def test_media_reply_without_pending_is_ignored():
     mock_img.assert_not_called()
     store.save_destination.assert_not_called()
     store.mark_processed.assert_called_once_with("instagram", "m2")
+
+
+def _make_text_reply(text="Kyoto, Japan", reply_to_item_id="ask_1"):
+    return TextReply(
+        platform="instagram",
+        item_id="reply1",
+        thread_id="t1",
+        text=text,
+        reply_to_item_id=reply_to_item_id,
+    )
+
+
+def test_trek_push_called_when_configured_and_no_failure_note_on_success():
+    from bot.extract import Extracted
+
+    store = _make_store()
+    source = MagicMock()
+    source.platform = "instagram"
+    cfg = _make_cfg()
+    cfg.trek_url = "http://trek.local:3000"
+    cfg.trek_api_token = "trek_abc"
+    post = _make_post()
+
+    result = Extracted(
+        destination="Tokyo, Japan", confidence=0.9, source_field="caption", topic="best ramen spots",
+    )
+
+    with patch("bot.run.extract", return_value=result), \
+         patch("bot.run.push_destination", return_value=True) as mock_push:
+        handle_posts(store, source, [post], cfg)
+
+    mock_push.assert_called_once_with(
+        cfg,
+        platform="instagram",
+        link=post.link,
+        destination="Tokyo, Japan",
+        landmark=None,
+        place_type=None,
+        topic="best ramen spots",
+        caption_snippet="beautiful sunset",
+    )
+    reply_text = source.reply.call_args.args[1]
+    assert "Couldn't sync to TREK" not in reply_text
+
+
+def test_trek_push_failure_appends_note_to_reply():
+    from bot.extract import Extracted
+
+    store = _make_store()
+    source = MagicMock()
+    source.platform = "instagram"
+    cfg = _make_cfg()
+    cfg.trek_url = "http://trek.local:3000"
+    cfg.trek_api_token = "trek_abc"
+    post = _make_post()
+
+    result = Extracted(destination="Tokyo, Japan", confidence=0.9, source_field="caption")
+
+    with patch("bot.run.extract", return_value=result), \
+         patch("bot.run.push_destination", return_value=False):
+        handle_posts(store, source, [post], cfg)
+
+    reply_text = source.reply.call_args.args[1]
+    assert "Couldn't sync to TREK" in reply_text
+
+
+def test_trek_push_skipped_when_not_configured():
+    from bot.extract import Extracted
+
+    store = _make_store()
+    source = MagicMock()
+    source.platform = "instagram"
+    cfg = _make_cfg()  # trek_url/trek_api_token default to None
+    post = _make_post()
+
+    result = Extracted(destination="Tokyo, Japan", confidence=0.9, source_field="caption")
+
+    with patch("bot.run.extract", return_value=result), \
+         patch("bot.run.push_destination") as mock_push:
+        handle_posts(store, source, [post], cfg)
+
+    mock_push.assert_not_called()
+
+
+def test_handle_replies_pushes_to_trek_silently_on_success():
+    store = _make_store()
+    store.get_pending_by_ask_msg.return_value = {
+        "link": "https://www.instagram.com/p/ABC/", "caption_snippet": None, "ask_msg_id": "ask_1",
+    }
+    store.save_destination.return_value = True
+    source = MagicMock()
+    source.platform = "instagram"
+    cfg = _make_cfg()
+    cfg.trek_url = "http://trek.local:3000"
+    cfg.trek_api_token = "trek_abc"
+    reply = _make_text_reply()
+
+    with patch("bot.run.push_destination", return_value=True) as mock_push:
+        handle_replies(store, source, [reply], cfg)
+
+    mock_push.assert_called_once_with(
+        cfg,
+        platform="instagram",
+        link="https://www.instagram.com/p/ABC/",
+        destination="Kyoto, Japan",
+        landmark=None,
+        place_type=None,
+        topic=None,
+        caption_snippet=None,
+    )
+    source.reply.assert_not_called()  # stays silent on success, matches existing behavior
+
+
+def test_handle_replies_replies_with_failure_note_when_push_fails():
+    store = _make_store()
+    store.get_pending_by_ask_msg.return_value = {
+        "link": "https://www.instagram.com/p/ABC/", "caption_snippet": None, "ask_msg_id": "ask_1",
+    }
+    store.save_destination.return_value = True
+    source = MagicMock()
+    source.platform = "instagram"
+    cfg = _make_cfg()
+    cfg.trek_url = "http://trek.local:3000"
+    cfg.trek_api_token = "trek_abc"
+    reply = _make_text_reply()
+
+    with patch("bot.run.push_destination", return_value=False):
+        handle_replies(store, source, [reply], cfg)
+
+    source.reply.assert_called_once()
+    assert "Couldn't sync to TREK" in source.reply.call_args.args[1]
+
+
+def test_handle_replies_skips_trek_when_not_configured():
+    store = _make_store()
+    store.get_pending_by_ask_msg.return_value = {
+        "link": "https://www.instagram.com/p/ABC/", "caption_snippet": None, "ask_msg_id": "ask_1",
+    }
+    store.save_destination.return_value = True
+    source = MagicMock()
+    source.platform = "instagram"
+    cfg = _make_cfg()
+    reply = _make_text_reply()
+
+    with patch("bot.run.push_destination") as mock_push:
+        handle_replies(store, source, [reply], cfg)
+
+    mock_push.assert_not_called()
+    source.reply.assert_not_called()

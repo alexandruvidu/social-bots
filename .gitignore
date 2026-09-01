@@ -3,6 +3,7 @@
 .env*
 !.env.example
 data/
+downloads/
 .venv/
 __pycache__/
 *.pyc

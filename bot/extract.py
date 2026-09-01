@@ -37,6 +37,36 @@ _MAX_ATTEMPTS = 4
 # the post for a background retry.
 _MAX_INLINE_WAIT = 5.0
 
+# Shared across all three system prompts so a canonicalization rule can't
+# drift out of sync between them. The destination string is the dedup key
+# once it leaves this bot (matched by exact text downstream), so the same
+# real-world place must always come back as the same characters.
+_CANONICAL_DESTINATION = (
+    "When you find one, normalize it to 'City, Country' (or 'Region, Country' / "
+    "'Country' if that is the most specific that's clearly supported) using this "
+    "EXACT canonical form every time, so the same real-world place always produces "
+    "identical text across different posts: the place's most common English "
+    "exonym (e.g. 'Rome' not 'Roma', 'Munich' not 'München'), the country's short "
+    "official English name (e.g. 'Japan', 'United States' — not 'USA' or 'the "
+    "States'), no diacritics, no leading articles ('the'), no administrative "
+    "qualifiers beyond what's needed to identify the place (e.g. 'Kyoto, Japan' "
+    "not 'Kyoto City, Kyoto Prefecture, Japan'), and exactly one comma with one "
+    "space separating each part — no trailing punctuation or extra whitespace."
+)
+
+# Shared across all three system prompts for the same reason as
+# _CANONICAL_DESTINATION: one instruction, applied identically everywhere,
+# instead of three copies that can drift.
+_TOPIC_INSTRUCTION = (
+    "Also give a short topic phrase (roughly 3-8 words, under 60 characters) "
+    "summarizing what this specific post/segment is actually about — this is used "
+    "as a bookmark label, so it should tell someone what they'd get out of "
+    "revisiting it, not just restate the destination or landmark name. Good "
+    "examples: 'rules about trains in Japan', 'best ramen spots', 'how to skip "
+    "the shrine queue'. Return null if nothing more specific than the "
+    "destination/landmark itself is identifiable."
+)
+
 
 class RateLimitedError(Exception):
     """Gemini is quota-limited; retry after this many seconds."""
@@ -72,8 +102,7 @@ SYSTEM = (
     "own landmark/place_type/source_field/confidence, so every named stop is "
     "captured.\n"
     "Return null for a destination if no real-world place is reliably identifiable. "
-    "When you do find one, normalize it to 'City, Country' (or 'Region, Country' / "
-    "'Country' if that is the most specific that's clearly supported). "
+    + _CANONICAL_DESTINATION + " "
     "Also extract the specific named place shown or mentioned within that destination, "
     "if any is identifiable — this can be a tourist landmark/attraction (e.g. 'Eiffel "
     "Tower', 'Hongya Cave'), a specific restaurant/food stall (e.g. 'Chongqing BBQ'), "
@@ -83,7 +112,8 @@ SYSTEM = (
     "(tourist attraction/sight), 'restaurant' (any food/drink venue), or 'hotel' "
     "(accommodation) — whichever best describes that place; null if landmark is null. "
     "Set source_field to where the destination came from ('location', 'caption', or "
-    "'comments'), and confidence to a 0-1 score reflecting how trustworthy the source was."
+    "'comments'), and confidence to a 0-1 score reflecting how trustworthy the source was. "
+    + _TOPIC_INSTRUCTION
 )
 
 
@@ -100,14 +130,14 @@ VIDEO_SYSTEM = (
     "more_places, using the same fields; leave more_places empty if there's only one "
     "destination. "
     "Return null for a destination if no real-world place is reliably identifiable. "
-    "When you find one, normalize to 'City, Country' (or 'Region, Country' / "
-    "'Country' if more specific is unclear). "
+    + _CANONICAL_DESTINATION + " "
     "Also extract the specific named place shown or mentioned — a tourist landmark/ "
     "attraction (e.g. 'Eiffel Tower', 'Hongya Cave'), a specific restaurant/food stall "
     "(e.g. 'Chongqing BBQ'), or a specific hotel — or null if none is identifiable. "
     "When a landmark is found, set place_type to one of 'landmark', 'restaurant', or "
     "'hotel' — whichever best describes that place; null if landmark is null. "
-    "Set source_field to 'video', and confidence to a 0-1 score."
+    "Set source_field to 'video', and confidence to a 0-1 score. "
+    + _TOPIC_INSTRUCTION
 )
 
 
@@ -131,14 +161,14 @@ SCREENSHOT_SYSTEM = (
     "destination to more_places, using the same fields; leave more_places empty if "
     "there's only one destination. "
     "Return null for a destination if no real-world place is reliably identifiable. "
-    "When you find one, normalize to 'City, Country' (or 'Region, Country' / "
-    "'Country' if more specific is unclear). "
+    + _CANONICAL_DESTINATION + " "
     "Also extract the specific named place shown or mentioned — a tourist landmark/ "
     "attraction (e.g. 'Eiffel Tower', 'Hongya Cave'), a specific restaurant/food "
     "stall (e.g. 'Chongqing BBQ'), or a specific hotel — or null if none is "
     "identifiable. When a landmark is found, set place_type to one of 'landmark', "
     "'restaurant', or 'hotel'; null if landmark is null. "
-    "Set source_field to 'screenshot', and confidence to a 0-1 score."
+    "Set source_field to 'screenshot', and confidence to a 0-1 score. "
+    + _TOPIC_INSTRUCTION
 )
 
 
@@ -148,6 +178,7 @@ class Place(BaseModel):
     place_type: Optional[str] = None   # "landmark" | "restaurant" | "hotel", or None
     confidence: float = 0.0            # 0-1
     source_field: Optional[str] = None  # "location" | "caption" | "comments"
+    topic: Optional[str] = None        # short bookmark-style label, e.g. "rules about trains in Japan"
 
 
 class Extracted(Place):

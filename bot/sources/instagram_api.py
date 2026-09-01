@@ -7,6 +7,7 @@ Never logs in to Instagram — media comes from the webhook attachment itself.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 
 import httpx
 
@@ -16,15 +17,19 @@ log = logging.getLogger(__name__)
 
 PLATFORM = "instagram"
 GRAPH_API = "https://graph.instagram.com/v21.0"
-SHARE_ATTACHMENT_TYPES = {"ig_reel", "share", "video", "image"}
+# `ig_post` replaces the deprecated `share` type for feed-post shares (Meta
+# removed `share` after Feb 2026); both are kept since old events may still
+# use it.
+SHARE_ATTACHMENT_TYPES = {"ig_reel", "ig_post", "share", "video", "image"}
 
-# What each attachment type tells us about the media. `share` covers both
-# images and videos, so it stays unknown and gets sniffed at download time.
+# What each attachment type tells us about the media. `share`/`ig_post` cover
+# both images and videos, so they stay unknown and get sniffed at download time.
 ATTACHMENT_MEDIA_KINDS = {
     "ig_reel": "video",
     "video": "video",
     "image": "image",
     "share": None,
+    "ig_post": None,
 }
 
 # Hosts that serve an Instagram permalink rather than the media itself. A
@@ -47,10 +52,19 @@ class InstagramAPISource:
         access_token: str,
         ig_user_id: str,
         allowed_sender_id: str,
+        *,
+        enable_instaloader_enrichment: bool = False,
+        comments_limit: int = 25,
+        comments_fetch_limit: int = 100,
+        post_metadata_loader: Callable[..., object] | None = None,
     ):
         self.access_token = access_token
         self.ig_user_id = str(ig_user_id)
         self.allowed_sender_id = str(allowed_sender_id)
+        self.enable_instaloader_enrichment = enable_instaloader_enrichment
+        self.comments_limit = comments_limit
+        self.comments_fetch_limit = comments_fetch_limit
+        self._post_metadata_loader = post_metadata_loader
 
     def fetch_new(self) -> tuple[list[SharedPost], list[TextReply]]:
         return [], []
@@ -80,6 +94,53 @@ class InstagramAPISource:
     def persist(self) -> None:
         pass
 
+    def _enrich_permalink(self, item_id: str, thread_id: str, url: str) -> SharedPost:
+        """Add public metadata via Instaloader, without an account login.
+
+        A failed anonymous scrape is expected for some posts, so it returns a
+        usable link-only post and lets the normal media/user-reply fallback run.
+        """
+        fallback = SharedPost(
+            platform=PLATFORM, item_id=item_id, thread_id=thread_id, link=url
+        )
+        if not self.enable_instaloader_enrichment:
+            return fallback
+        try:
+            loader = self._post_metadata_loader
+            if loader is None:
+                from instagram_downloader import get_post_metadata
+                loader = get_post_metadata
+            metadata = loader(
+                url,
+                comments_limit=self.comments_limit,
+                comments_fetch_limit=self.comments_fetch_limit,
+            )
+            from .base import PostComment
+
+            comments = [
+                PostComment(
+                    text=comment.text,
+                    is_creator=comment.is_creator,
+                    likes=comment.likes,
+                    author=comment.author,
+                )
+                for comment in metadata.comments
+            ]
+            return SharedPost(
+                platform=PLATFORM,
+                item_id=item_id,
+                thread_id=thread_id,
+                link=url,
+                caption=metadata.caption,
+                location=metadata.location,
+                comments=comments,
+                media_url=metadata.media_url,
+                media_kind=metadata.media_kind,
+            )
+        except Exception:
+            log.info("Instaloader enrichment unavailable for %s", url, exc_info=True)
+            return fallback
+
     def build_post_from_event(self, messaging: dict) -> SharedPost | None:
         sender_id = str(messaging["sender"]["id"])
         message = messaging.get("message", {})
@@ -106,13 +167,20 @@ class InstagramAPISource:
             "build_post_from_event: %s attachment on message %s; raw payload=%r",
             atype, mid, attachment.get("payload"),
         )
+        caption = attachment.get("payload", {}).get("title")
         if _is_permalink(url):
-            return SharedPost(platform=PLATFORM, item_id=mid, thread_id=sender_id, link=url)
+            post = self._enrich_permalink(mid, sender_id, url)
+            # The official webhook title is a useful fallback if Instagram's
+            # anonymous endpoint did not provide a caption.
+            if post.caption is None and caption:
+                post.caption = caption
+            return post
         return SharedPost(
             platform=PLATFORM,
             item_id=mid,
             thread_id=sender_id,
             link=url,
+            caption=caption,
             media_url=url,
             media_kind=ATTACHMENT_MEDIA_KINDS.get(atype),
         )
